@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quorum desktop</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0;background:#F4F5F7}
+a{color:#1F5FD1}a:hover{color:#163F8C}
+button{font-family:inherit;cursor:pointer}
+button:focus-visible{outline:2px solid #1F5FD1;outline-offset:2px}
+</style>
+</helmet>
+<div style="position: relative; min-height: 960px; display: flex; flex-wrap: wrap; font-family: 'IBM Plex Sans', system-ui, sans-serif; color: #121619; background: #F4F5F7; font-size: 14px; line-height: 1.45">
+
+<nav aria-label="Workspace" style="flex: 1 1 232px; max-width: 100%; box-sizing: border-box; padding: 20px 14px; background: #121619; color: #E8EBEF; display: flex; flex-direction: column; gap: 22px">
+<div style="display: flex; align-items: center; gap: 10px; padding: 0 8px">
+<svg width="26" height="26" viewBox="0 0 26 26" aria-hidden="true"><circle cx="9" cy="13" r="6" fill="none" stroke="#E8EBEF" stroke-width="2"></circle><rect x="13" y="7" width="12" height="12" rx="3" fill="none" stroke="{{accent}}" stroke-width="2"></rect></svg>
+<div style="font-weight: 700; font-size: 17px; letter-spacing: -0.01em">Quorum</div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 4px">
+<sc-for list="{{nav}}" as="n" hint-placeholder-count="3">
+<button onClick="{{n.go}}" style="{{n.style}}">
+<span>{{n.label}}</span>
+<sc-if value="{{n.hasCount}}" hint-placeholder-val="{{true}}"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 1px 7px; border-radius: 10px; background: #2B3138; color: #E8EBEF">{{n.count}}</span></sc-if>
+</button>
+</sc-for>
+</div>
+<div style="display: flex; flex-direction: column; gap: 8px; padding: 0 8px">
+<div style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #A7B0BA">Work items</div>
+<div style="font-size: 13px; color: #E8EBEF">NPU compiler · Q4 perf</div>
+<div style="font-size: 13px; color: #C9D0D7">Sim fidelity regression</div>
+<div style="font-size: 13px; color: #C9D0D7">Reimbursements · Oct</div>
+</div>
+<div style="margin-top: auto; padding: 12px 8px 0; border-top: 1px solid #2B3138; display: flex; flex-direction: column; gap: 6px">
+<div style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #A7B0BA">Legend</div>
+<div style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #C9D0D7"><span style="width: 14px; height: 14px; border-radius: 50%; border: 2px solid #E8EBEF; box-sizing: border-box"></span>Human</div>
+<div style="display: flex; align-items: center; gap: 8px; font-size: 12px; color: #C9D0D7"><span style="width: 14px; height: 14px; border-radius: 3px; border: 2px solid {{accent}}; box-sizing: border-box"></span>Agent, acting for a human</div>
+</div>
+</nav>
+
+<main style="flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 20px 28px 32px; display: flex; flex-direction: column; gap: 20px">
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+<label for="ask" style="position: absolute; left: -9999px">Ask or delegate</label>
+<input id="ask" placeholder="Ask, or delegate: “@forge take the fusion pass until Fri, $50, escalate if pass rate &lt; 98%”" style="flex: 1 1 420px; min-width: 0; height: 44px; box-sizing: border-box; padding: 0 14px; border: 1px solid #C9CED5; border-radius: 8px; background: #FFFFFF; font: inherit; color: #121619">
+<div style="display: flex; gap: 8px; align-items: center; font-size: 13px; color: #525B66">
+<span style="font-family: 'IBM Plex Mono', monospace; color: #121619; font-weight: 500">{{openCount}}</span> need you
+<span aria-hidden="true">·</span>
+<span style="font-family: 'IBM Plex Mono', monospace; color: #121619; font-weight: 500">41</span> agent events digested today
+</div>
+</div>
+
+<sc-if value="{{isInbox}}" hint-placeholder-val="{{true}}">
+<section aria-label="Decisions" style="display: flex; flex-direction: column; gap: 14px">
+<div>
+<h1 style="margin: 0; font-size: 24px; letter-spacing: -0.01em">Decisions only you can make</h1>
+<p style="margin: 4px 0 0; color: #525B66">Everything else your agents handled. Each ask shows what changes, the risk, and what happens if you ignore it.</p>
+</div>
+<div style="display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start">
+<div style="flex: 1 1 320px; min-width: 0; display: flex; flex-direction: column; gap: 8px">
+<sc-for list="{{decisions}}" as="d" hint-placeholder-count="5">
+<button onClick="{{d.open}}" style="{{d.cardStyle}}">
+<div style="display: flex; align-items: center; gap: 8px; justify-content: space-between">
+<div style="display: flex; align-items: center; gap: 8px">
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 500; padding: 2px 6px; border-radius: 4px; border: 1.5px solid {{accent}}; color: #121619">{{d.agent}}</span>
+<span style="font-size: 12px; color: #525B66">{{d.kind}}</span>
+</div>
+<span style="{{d.riskStyle}}">{{d.riskLabel}}</span>
+</div>
+<div style="font-weight: 600; font-size: 14px; margin-top: 6px; text-align: left">{{d.title}}</div>
+<div style="font-size: 12px; color: #525B66; margin-top: 4px; text-align: left">{{d.status}}</div>
+</button>
+</sc-for>
+</div>
+
+<article style="flex: 2 1 460px; min-width: 0; background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; padding: 22px 24px; display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-wrap: wrap; gap: 10px; align-items: center; font-size: 13px; color: #525B66">
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 500; padding: 2px 8px; border-radius: 4px; border: 1.5px solid {{accent}}; color: #121619">{{sel.agent}}</span>
+<span>acting for <strong style="color: #121619">{{sel.onBehalf}}</strong></span>
+<span aria-hidden="true">·</span>
+<span>{{sel.work}}</span>
+<span aria-hidden="true">·</span>
+<span style="color: #B4460B; font-weight: 500">{{sel.due}}</span>
+</div>
+<h2 style="margin: 0; font-size: 22px; letter-spacing: -0.01em">{{sel.title}}</h2>
+<p style="margin: 0; font-size: 15px; color: #2A3036">{{sel.why}}</p>
+<div style="display: flex; flex-direction: column; gap: 6px; background: #F4F5F7; border-radius: 8px; padding: 12px 14px">
+<div style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #525B66">Evidence</div>
+<sc-for list="{{sel.evidence}}" as="e" hint-placeholder-count="3">
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #121619">{{e}}</div>
+</sc-for>
+</div>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px">
+<sc-for list="{{sel.facts}}" as="f" hint-placeholder-count="4">
+<div style="border: 1px solid #DDE1E6; border-radius: 8px; padding: 10px 12px">
+<div style="font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: #525B66">{{f.k}}</div>
+<div style="font-size: 14px; font-weight: 500; margin-top: 2px">{{f.v}}</div>
+</div>
+</sc-for>
+</div>
+<sc-if value="{{sel.isOpen}}" hint-placeholder-val="{{true}}">
+<div style="display: flex; flex-direction: column; gap: 10px">
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<sc-for list="{{sel.options}}" as="o" hint-placeholder-count="3">
+<button onClick="{{o.choose}}" style="{{o.style}}">{{o.label}}</button>
+</sc-for>
+</div>
+<div style="font-size: 13px; color: #525B66">If you don't respond: <strong style="color: #121619">{{sel.fallback}}</strong></div>
+</div>
+</sc-if>
+<sc-if value="{{sel.isDone}}" hint-placeholder-val="{{false}}">
+<div style="display: flex; align-items: center; gap: 10px; padding: 12px 14px; border-radius: 8px; background: #E7F3EC; color: #14532D; font-weight: 500">
+<svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true"><path d="M3 9.5l4 4 8-9" fill="none" stroke="#14532D" stroke-width="2"></path></svg>
+{{sel.doneText}}
+</div>
+</sc-if>
+</article>
+</div>
+</section>
+</sc-if>
+
+<sc-if value="{{isWork}}" hint-placeholder-val="{{false}}">
+<section aria-label="Work item" style="display: flex; flex-direction: column; gap: 16px">
+<div style="display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: flex-end">
+<div>
+<div style="font-size: 12px; color: #525B66">Work item · owned by Hardik · due Dec 15</div>
+<h1 style="margin: 2px 0 0; font-size: 24px; letter-spacing: -0.01em">NPU compiler · Q4 perf</h1>
+<p style="margin: 4px 0 0; color: #2A3036; max-width: 720px">Goal: cut median kernel latency 10% on the Q4 benchmark set without regressing correctness.</p>
+</div>
+<button onClick="{{openDelegate}}" style="height: 44px; padding: 0 18px; border-radius: 8px; border: none; background: {{accent}}; color: #FFFFFF; font-weight: 600; font-size: 14px">Delegate…</button>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start">
+<div style="flex: 2 1 480px; min-width: 0; background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; padding: 18px 20px; display: flex; flex-direction: column; gap: 4px">
+<div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px">
+<h2 style="margin: 0; font-size: 16px">Event log</h2>
+<span style="font-size: 12px; color: #525B66">Structured events, rendered as prose · select one for its payload</span>
+</div>
+<sc-for list="{{events}}" as="ev" hint-placeholder-count="6">
+<div style="border-top: 1px solid #ECEEF1; padding: 10px 0">
+<button onClick="{{ev.toggle}}" aria-expanded="{{ev.expanded}}" style="width: 100%; display: flex; gap: 12px; align-items: flex-start; background: none; border: none; padding: 0; text-align: left; color: #121619; font-size: 14px">
+<span style="{{ev.kindStyle}}">{{ev.kind}}</span>
+<span style="{{ev.actorStyle}}">{{ev.actor}}</span>
+<span style="flex: 1; min-width: 0">{{ev.summary}}</span>
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #525B66; white-space: nowrap">{{ev.time}}</span>
+</button>
+<sc-if value="{{ev.expanded}}" hint-placeholder-val="{{false}}">
+<div style="margin: 8px 0 0 92px; padding: 10px 12px; border-radius: 6px; background: #121619; color: #D6F0E0; font-family: 'IBM Plex Mono', monospace; font-size: 12px; white-space: pre-wrap">{{ev.detail}}</div>
+</sc-if>
+</div>
+</sc-for>
+</div>
+
+<aside style="flex: 1 1 280px; min-width: 0; display: flex; flex-direction: column; gap: 12px">
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+<h2 style="margin: 0; font-size: 15px">Contract</h2>
+<div style="display: flex; justify-content: space-between; font-size: 13px"><span style="color: #525B66">Budget</span><span style="font-family: 'IBM Plex Mono', monospace">$212 / $400</span></div>
+<div style="height: 8px; border-radius: 4px; background: #ECEEF1; overflow: hidden"><div style="width: 53%; height: 8px; background: {{accent}}"></div></div>
+<div style="display: flex; justify-content: space-between; font-size: 13px"><span style="color: #525B66">Progress to goal</span><span style="font-family: 'IBM Plex Mono', monospace">7.4% of 10%</span></div>
+<div style="height: 8px; border-radius: 4px; background: #ECEEF1; overflow: hidden"><div style="width: 74%; height: 8px; background: #1E7B4A"></div></div>
+<div style="font-size: 13px; color: #525B66">Escalates to owner on spend over budget or any correctness regression.</div>
+<sc-for list="{{delegations}}" as="dg" hint-placeholder-count="0">
+<div style="border: 1.5px dashed {{accent}}; border-radius: 8px; padding: 10px 12px; font-size: 13px">
+<div style="font-weight: 600">New delegation</div>
+<div style="color: #2A3036">{{dg}}</div>
+</div>
+</sc-for>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 10px">
+<h2 style="margin: 0; font-size: 15px">Participants</h2>
+<sc-for list="{{participants}}" as="p" hint-placeholder-count="5">
+<div style="display: flex; align-items: center; gap: 10px">
+<span style="{{p.avatarStyle}}">{{p.initials}}</span>
+<div style="flex: 1; min-width: 0">
+<div style="font-weight: 500; font-size: 14px">{{p.name}}</div>
+<div style="font-size: 12px; color: #525B66">{{p.role}}</div>
+</div>
+</div>
+</sc-for>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; padding: 16px 18px; display: flex; flex-direction: column; gap: 8px">
+<h2 style="margin: 0; font-size: 15px">Artifacts</h2>
+<a href="#" style="font-size: 14px">MR !4821 · conv+bn+relu fusion</a>
+<a href="#" style="font-size: 14px">Benchmark report · Oct 29</a>
+<a href="#" style="font-size: 14px">Plan v2 (approved, modified)</a>
+</div>
+</aside>
+</div>
+</section>
+</sc-if>
+
+<sc-if value="{{isGov}}" hint-placeholder-val="{{false}}">
+<section aria-label="Governance" style="display: flex; flex-direction: column; gap: 16px">
+<div>
+<h1 style="margin: 0; font-size: 24px; letter-spacing: -0.01em">Agents and policy</h1>
+<p style="margin: 4px 0 0; color: #525B66">Autonomy is earned: an agent moves up a tier only when its evals clear 95% over its last 200 runs.</p>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 12px; overflow-x: auto">
+<table style="width: 100%; min-width: 860px; border-collapse: collapse; font-size: 14px">
+<thead>
+<tr style="text-align: left; color: #525B66; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em">
+<th style="padding: 12px 16px; font-weight: 500">Agent</th>
+<th style="padding: 12px 8px; font-weight: 500">Owner</th>
+<th style="padding: 12px 8px; font-weight: 500">Autonomy tier</th>
+<th style="padding: 12px 8px; font-weight: 500">Evals (200 runs)</th>
+<th style="padding: 12px 8px; font-weight: 500">Spend 7d</th>
+<th style="padding: 12px 8px; font-weight: 500">Scopes</th>
+<th style="padding: 12px 16px; font-weight: 500">Actions</th>
+</tr>
+</thead>
+<tbody>
+<sc-for list="{{agents}}" as="ag" hint-placeholder-count="5">
+<tr style="border-top: 1px solid #ECEEF1">
+<td style="padding: 12px 16px">
+<div style="display: flex; align-items: center; gap: 8px"><span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 500; padding: 2px 6px; border-radius: 4px; border: 1.5px solid {{accent}}">{{ag.name}}</span><span style="font-size: 12px; color: #525B66">{{ag.does}}</span></div>
+</td>
+<td style="padding: 12px 8px">{{ag.owner}}</td>
+<td style="padding: 12px 8px"><span style="{{ag.tierStyle}}">{{ag.tier}}</span></td>
+<td style="padding: 12px 8px; font-family: 'IBM Plex Mono', monospace">{{ag.eval}}</td>
+<td style="padding: 12px 8px; font-family: 'IBM Plex Mono', monospace">{{ag.spend}}</td>
+<td style="padding: 12px 8px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #2A3036">{{ag.scopes}}</td>
+<td style="padding: 12px 16px">
+<div style="display: flex; gap: 6px; flex-wrap: wrap">
+<button onClick="{{ag.promote}}" disabled="{{ag.cantPromote}}" style="{{ag.promoteStyle}}">{{ag.promoteLabel}}</button>
+<button onClick="{{ag.quarantine}}" style="height: 36px; padding: 0 12px; border-radius: 6px; border: 1px solid #C9CED5; background: #FFFFFF; color: #8A2E07; font-size: 13px">{{ag.qLabel}}</button>
+</div>
+</td>
+</tr>
+</sc-for>
+</tbody>
+</table>
+</div>
+<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px">
+<sc-for list="{{policies}}" as="po" hint-placeholder-count="5">
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px">
+<div style="display: flex; justify-content: space-between; align-items: center">
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; color: #525B66">{{po.id}}</span>
+<span style="{{po.modeStyle}}">{{po.mode}}</span>
+</div>
+<div style="font-weight: 500">{{po.rule}}</div>
+<div style="font-size: 12px; color: #525B66">{{po.hits}}</div>
+</div>
+</sc-for>
+</div>
+</section>
+</sc-if>
+</main>
+
+<sc-if value="{{delegateOpen}}" hint-placeholder-val="{{false}}">
+<div style="position: absolute; inset: 0; background: rgba(18, 22, 25, 0.45); display: flex; align-items: flex-start; justify-content: center; padding: 96px 16px">
+<div role="dialog" aria-label="Delegate" style="width: 100%; max-width: 520px; background: #FFFFFF; border-radius: 14px; padding: 22px 24px; display: flex; flex-direction: column; gap: 16px; box-shadow: 0 20px 50px rgba(0,0,0,0.25)">
+<h2 style="margin: 0; font-size: 19px">Delegate part of this work item</h2>
+<p style="margin: 0; color: #525B66; font-size: 14px">This creates a contract the agent is held to. Its token is scoped to this work item and expires with the deadline.</p>
+<div style="display: flex; flex-direction: column; gap: 6px">
+<div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #525B66">Agent</div>
+<div style="display: flex; gap: 8px; flex-wrap: wrap"><sc-for list="{{dAgents}}" as="x" hint-placeholder-count="3"><button onClick="{{x.pick}}" style="{{x.style}}">{{x.label}}</button></sc-for></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px">
+<div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #525B66">Budget</div>
+<div style="display: flex; gap: 8px; flex-wrap: wrap"><sc-for list="{{dBudgets}}" as="x" hint-placeholder-count="3"><button onClick="{{x.pick}}" style="{{x.style}}">{{x.label}}</button></sc-for></div>
+</div>
+<div style="display: flex; flex-direction: column; gap: 6px">
+<div style="font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: #525B66">Until</div>
+<div style="display: flex; gap: 8px; flex-wrap: wrap"><sc-for list="{{dUntil}}" as="x" hint-placeholder-count="3"><button onClick="{{x.pick}}" style="{{x.style}}">{{x.label}}</button></sc-for></div>
+</div>
+<div style="font-size: 14px; padding: 10px 12px; border-radius: 8px; background: #F4F5F7">Escalate to you if pass rate drops below 98% or spend reaches the budget.</div>
+<div style="display: flex; gap: 8px; justify-content: flex-end">
+<button onClick="{{closeDelegate}}" style="height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #C9CED5; background: #FFFFFF; font-size: 14px; color: #121619">Cancel</button>
+<button onClick="{{confirmDelegate}}" style="height: 44px; padding: 0 18px; border-radius: 8px; border: none; background: {{accent}}; color: #FFFFFF; font-weight: 600; font-size: 14px">Create contract</button>
+</div>
+</div>
+</div>
+</sc-if>
+
+<sc-if value="{{hasToast}}" hint-placeholder-val="{{false}}">
+<div role="status" style="position: absolute; right: 24px; bottom: 24px; max-width: 420px; background: #121619; color: #F4F5F7; border-radius: 10px; padding: 12px 16px; font-size: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.25)">{{toast}}</div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","default":"#1F5FD1","options":["#1F5FD1","#0F766E","#7C3AED","#B4460B"]},"$preview":{"width":1440,"height":960}}'>
+class Component extends DCLogic {
+  constructor(props) {
+    super(props);
+    this.state = {
+      view: 'inbox', openId: 'd1', resolved: {}, toast: '', expanded: 'e3',
+      tierBump: {}, quarantined: {}, delegateOpen: false,
+      dAgent: 'KERNEL-GEN', dBudget: '$50', dUntil: 'Fri', delegations: []
+    };
+  }
+  flash(msg) {
+    this.setState({ toast: msg });
+    clearTimeout(this._t);
+    this._t = setTimeout(() => this.setState({ toast: '' }), 3200);
+  }
+  renderVals() {
+    const accent = this.props.accent ?? '#1F5FD1';
+    const s = this.state;
+    const mono = "font-family: 'IBM Plex Mono', monospace;";
+    const riskStyles = {
+      Low: 'font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #E7F3EC; color: #14532D',
+      Medium: 'font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #FDF1DC; color: #7A4A00',
+      High: 'font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #FBE4DA; color: #8A2E07'
+    };
+    const D = [
+      { id: 'd1', agent: 'FORGE', kind: 'Approve merge', risk: 'Medium', onBehalf: 'Hardik', work: 'NPU compiler · Q4 perf', due: 'Due 6:00 PM',
+        title: 'Merge MR !4821 into compiler/main',
+        why: 'Fuses conv + batch-norm + ReLU in the NPU lowering pass. 142 of 145 regression kernels pass; the 3 failures are known flakes seen in 11 of the last 20 nightlies.',
+        evidence: ['+312 −48 across 6 files · sandbox sbx-7f2', 'Median latency −7.4% on 38 benchmark kernels', 'Risk score 0.31 · touches codegen (policy P-03)'],
+        facts: [{ k: 'Reversible', v: 'Yes · one-click revert' }, { k: 'Blast radius', v: 'compiler/main · 23 jobs' }, { k: 'Agent confidence', v: '0.86' }, { k: 'Cost so far', v: '$3.20' }],
+        options: ['Approve & merge', 'Request changes', 'Hold for review'], fallback: 'Holds at 6:00 PM, nothing merges' },
+      { id: 'd4', agent: 'GUARD', kind: 'Policy hold', risk: 'High', onBehalf: 'Finance Ops', work: 'Reimbursements · Oct', due: 'Due in 24h',
+        title: 'Outbound email held: contains part numbers',
+        why: 'The expense agent drafted a reply to an external supplier that includes 4 internal part numbers. Policy P-07 blocks unreleased part numbers from leaving the org.',
+        evidence: ['Recipient: external domain', 'Matched 4 part numbers against P-07', 'Rest of draft is a routine invoice query'],
+        facts: [{ k: 'Reversible', v: 'No · email leaves the org' }, { k: 'Blast radius', v: '1 external recipient' }, { k: 'Match confidence', v: '0.93' }, { k: 'Cost', v: '—' }],
+        options: ['Send redacted', 'Edit draft', 'Drop'], fallback: 'Dropped after 24 hours' },
+      { id: 'd3', agent: 'SIM-VAL', kind: 'Budget', risk: 'Medium', onBehalf: 'Wei', work: 'Sim fidelity regression', due: 'Due 10:00 PM',
+        title: 'Exceed budget by $140 to re-run 1,200 scenarios',
+        why: 'A fidelity check flagged a sensor-model regression after last night’s build. Re-running the affected scenario set needs GPU time beyond this week’s budget.',
+        evidence: ['Cut-in pass rate 99.1% → 96.4%', 'Bisected to the lidar noise-model change', 'Estimate: 3.5 GPU-hours'],
+        facts: [{ k: 'Reversible', v: 'No · spend is final' }, { k: 'Blast radius', v: 'Shared sim cluster, low load' }, { k: 'Agent confidence', v: '0.78' }, { k: 'Cost', v: '+$140 over $400' }],
+        options: ['Approve $140', 'Top 300 only ($35)', 'Decline'], fallback: 'Runs the top 300 only at 10:00 PM' },
+      { id: 'd2', agent: 'IAM', kind: 'Access', risk: 'Low', onBehalf: 'Wei', work: 'AV safety reviews', due: 'Due tomorrow',
+        title: 'Give SCRIBE read access to #av-safety-review for 7 days',
+        why: 'Wei asked SCRIBE to summarize safety review meetings. Its current scope excludes this channel. The grant is read-only and time-boxed.',
+        evidence: ['Scope: meetings.read, docs.read (this channel only)', 'Expires Nov 7 automatically', 'Token exchange on behalf of Wei'],
+        facts: [{ k: 'Reversible', v: 'Yes · auto-expires' }, { k: 'Blast radius', v: '1 channel · 9 members' }, { k: 'Agent confidence', v: '—' }, { k: 'Cost', v: '$0' }],
+        options: ['Grant 7 days', 'Grant 24 hours', 'Deny'], fallback: 'Denied' },
+      { id: 'd5', agent: 'SCRIBE', kind: 'Review', risk: 'Low', onBehalf: 'Hardik', work: 'AV safety reviews', due: 'Due 9:00 AM',
+        title: 'Confirm 3 action items from the AV safety sync',
+        why: 'Extracted from yesterday’s meeting. Two items have explicit owners; one owner was inferred from discussion.',
+        evidence: ['Wei · update cut-in thresholds · Nov 4', 'Priya · file fidelity bug · Nov 1', 'Inferred: Hardik · review sim budget'],
+        facts: [{ k: 'Reversible', v: 'Yes' }, { k: 'Blast radius', v: '3 people notified' }, { k: 'Agent confidence', v: '0.71 on inferred item' }, { k: 'Cost', v: '$0.40' }],
+        options: ['Confirm all', 'Confirm 2, drop inferred', 'Edit items'], fallback: 'Posted as a draft at 9:00 AM' }
+    ];
+    const openCount = D.filter((d) => !s.resolved[d.id]).length;
+    const decisions = D.map((d) => {
+      const sel = d.id === s.openId; const done = s.resolved[d.id];
+      return {
+        ...d, riskLabel: d.risk + ' risk', riskStyle: riskStyles[d.risk],
+        status: done ? '✓ ' + done : d.due + ' · for ' + d.onBehalf,
+        cardStyle: 'width: 100%; display: block; text-align: left; padding: 12px 14px; border-radius: 10px; font-size: 14px; color: #121619; background: #FFFFFF; border: ' + (sel ? '2px solid ' + accent : '1px solid #DDE1E6') + '; opacity: ' + (done ? '0.6' : '1'),
+        open: () => this.setState({ openId: d.id })
+      };
+    });
+    const cur = D.find((d) => d.id === s.openId) || D[0];
+    const curDone = s.resolved[cur.id];
+    const sel = {
+      ...cur, isOpen: !curDone, isDone: !!curDone,
+      doneText: curDone ? curDone + ' · co-signed by you · written to the trace' : '',
+      options: cur.options.map((label, i) => ({
+        label,
+        style: i === 0
+          ? 'height: 44px; padding: 0 18px; border-radius: 8px; border: none; background: ' + accent + '; color: #FFFFFF; font-weight: 600; font-size: 14px'
+          : 'height: 44px; padding: 0 16px; border-radius: 8px; border: 1px solid #C9CED5; background: #FFFFFF; color: #121619; font-size: 14px',
+        choose: () => {
+          const resolved = { ...s.resolved, [cur.id]: label };
+          const next = D.find((d) => !resolved[d.id]);
+          this.setState({ resolved, openId: next ? next.id : cur.id });
+          this.flash(label + ' — ' + cur.agent + ' notified. ' + (next ? 'Next: ' + next.title : 'Inbox clear.'));
+        }
+      }))
+    };
+
+    const nav = [['inbox', 'Decisions', openCount], ['work', 'Work item', null], ['gov', 'Agents & policy', null]].map(([id, label, count]) => ({
+      label, count, hasCount: count !== null,
+      go: () => this.setState({ view: id }),
+      style: 'display: flex; justify-content: space-between; align-items: center; width: 100%; min-height: 44px; padding: 0 10px; border-radius: 8px; border: none; font-size: 14px; text-align: left; color: #F4F5F7; background: ' + (s.view === id ? '#2B3138' : 'transparent') + '; font-weight: ' + (s.view === id ? '600' : '400')
+    }));
+
+    const kindColors = { plan: '#E8EEFB', human: '#ECEEF1', tool: '#F1ECFB', eval: '#E7F3EC', policy: '#FBE4DA', ask: '#FDF1DC' };
+    const E = [
+      { id: 'e1', kind: 'plan', actor: 'FORGE', agent: true, time: 'Mon 09:12', summary: 'Proposed a plan: 3 fusion passes, ranked by expected gain', detail: 'event: plan.proposed\nplan_id: plan.v2   steps: 3   est_cost: $40\non_behalf_of: hardik   scope: repo:compiler (read)' },
+      { id: 'e2', kind: 'human', actor: 'Hardik', agent: false, time: 'Mon 09:40', summary: 'Approved the plan; skip pass 3 until after code freeze', detail: 'event: decision.made\nrequest: plan.v2   outcome: approve(modified)\nsignature: hardik@xpeng   reversible: yes' },
+      { id: 'e3', kind: 'tool', actor: 'FORGE', agent: true, time: 'Tue 14:03', summary: 'Opened MR !4821 — conv + bn + relu fusion', detail: 'event: tool.call   tool: git.create_mr\nfiles: 6   diff: +312 / -48   sandbox: sbx-7f2\ntoken: delegated(hardik → forge, ttl 72h)   cost: $1.10' },
+      { id: 'e4', kind: 'eval', actor: 'EVAL', agent: true, time: 'Wed 02:10', summary: 'Nightly: 142/145 kernels pass, median latency −7.4%', detail: 'event: eval.completed   suite: npu-q4\npass: 142   fail: 3 (known flaky)   p50_latency: -7.4%\ntrace: loop://runs/8812' },
+      { id: 'e5', kind: 'policy', actor: 'GUARD', agent: true, time: 'Wed 02:11', summary: 'Merge needs a human co-sign: change touches codegen (P-03)', detail: 'event: policy.matched   policy: P-03\naction: escalate   tier: act-with-approval\nreason: path compiler/codegen/** modified' },
+      { id: 'e6', kind: 'ask', actor: 'FORGE', agent: true, time: 'Thu 08:30', summary: 'Asked Hardik to approve the merge', detail: 'event: decision.requested   id: d1\nto: hardik   default: hold @ 18:00\noptions: approve | request_changes | hold' }
+    ];
+    const events = E.map((e) => ({
+      ...e, expanded: s.expanded === e.id,
+      kindStyle: mono + ' font-size: 11px; padding: 2px 8px; border-radius: 4px; width: 56px; text-align: center; flex: none; color: #121619; background: ' + kindColors[e.kind],
+      actorStyle: mono + ' font-size: 12px; font-weight: 500; flex: none; width: 64px; ' + (e.agent ? 'color: #121619' : 'color: #525B66'),
+      toggle: () => this.setState({ expanded: s.expanded === e.id ? '' : e.id })
+    }));
+
+    const tiers = ['Shadow', 'Suggest', 'Act with approval', 'Autonomous'];
+    const tierStyle = (t) => 'font-size: 12px; font-weight: 600; padding: 3px 10px; border-radius: 10px; white-space: nowrap; ' + ({
+      Shadow: 'background: #ECEEF1; color: #2A3036', Suggest: 'background: #E8EEFB; color: #163F8C',
+      'Act with approval': 'background: #FDF1DC; color: #7A4A00', Autonomous: 'background: #E7F3EC; color: #14532D', Quarantined: 'background: #FBE4DA; color: #8A2E07'
+    })[t];
+    const avatar = (agent) => mono + ' width: 32px; height: 32px; flex: none; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; box-sizing: border-box; ' + (agent ? 'border-radius: 6px; border: 2px solid ' + accent : 'border-radius: 50%; border: 2px solid #121619');
+    const participants = [
+      { name: 'Hardik', role: 'Owner · human', initials: 'HK', agent: false },
+      { name: 'Ming', role: 'Reviewer · human', initials: 'MZ', agent: false },
+      { name: 'FORGE', role: 'Code agent · act with approval', initials: 'FG', agent: true },
+      { name: 'KERNEL-GEN', role: 'Kernel agent · suggest', initials: 'KG', agent: true },
+      { name: 'EVAL', role: 'Eval agent · autonomous', initials: 'EV', agent: true }
+    ].map((p) => ({ ...p, avatarStyle: avatar(p.agent) }));
+
+    const A = [
+      { name: 'FORGE', does: 'code changes', owner: 'Hardik', tier: 2, eval: 94, spend: '$86', scopes: 'git.mr · ci.run' },
+      { name: 'KERNEL-GEN', does: 'NPU kernels', owner: 'Ming', tier: 1, eval: 96, spend: '$41', scopes: 'repo.read · sandbox.exec' },
+      { name: 'SCRIBE', does: 'meetings', owner: 'Hardik', tier: 2, eval: 91, spend: '$12', scopes: 'meetings.read · docs.write' },
+      { name: 'EXPENSE', does: 'reimbursements', owner: 'Finance Ops', tier: 3, eval: 97, spend: '$9', scopes: 'forms.fill · mail.draft' },
+      { name: 'SIM-VAL', does: 'scenario runs', owner: 'Wei', tier: 2, eval: 95, spend: '$260', scopes: 'sim.run · gpu.reserve' }
+    ];
+    const agents = A.map((a) => {
+      const t = Math.min(3, a.tier + (s.tierBump[a.name] || 0));
+      const q = !!s.quarantined[a.name];
+      const top = t >= 3; const ok = a.eval >= 95 && !top && !q;
+      const tierName = q ? 'Quarantined' : tiers[t];
+      return {
+        ...a, tier: tierName, tierStyle: tierStyle(tierName), eval: a.eval + '%',
+        cantPromote: !ok,
+        promoteLabel: q ? 'Quarantined' : top ? 'Top tier' : ok ? 'Promote to ' + (tiers[t + 1] === 'Act with approval' ? 'approval' : tiers[t + 1].toLowerCase()) : 'Needs ≥95% evals',
+        promoteStyle: 'height: 36px; padding: 0 12px; border-radius: 6px; font-size: 13px; ' + (ok ? 'border: none; background: ' + accent + '; color: #FFFFFF; font-weight: 600' : 'border: 1px solid #DDE1E6; background: #F4F5F7; color: #525B66; cursor: not-allowed'),
+        promote: () => { if (!ok) return; this.setState({ tierBump: { ...s.tierBump, [a.name]: (s.tierBump[a.name] || 0) + 1 } }); this.flash(a.name + ' promoted to ' + tiers[t + 1] + '. Change logged with eval evidence.'); },
+        qLabel: q ? 'Release' : 'Quarantine',
+        quarantine: () => { this.setState({ quarantined: { ...s.quarantined, [a.name]: !q } }); this.flash(q ? a.name + ' released.' : a.name + ' quarantined: tokens revoked, in-flight runs paused.'); }
+      };
+    });
+    const pol = (m) => 'font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; ' + (m === 'Enforce' ? 'background: #121619; color: #F4F5F7' : 'background: #ECEEF1; color: #2A3036');
+    const policies = [
+      { id: 'P-03', rule: 'Codegen changes need a human co-sign', mode: 'Enforce', hits: '14 escalations this week' },
+      { id: 'P-07', rule: 'Unreleased part numbers can’t leave the org', mode: 'Enforce', hits: '3 holds this week' },
+      { id: 'P-11', rule: 'Spend over budget escalates to the owner', mode: 'Enforce', hits: '2 escalations this week' },
+      { id: 'P-14', rule: 'Personal data stays in its home region', mode: 'Enforce', hits: '0 this week' },
+      { id: 'P-19', rule: 'Agents may not message more than 20 people', mode: 'Monitor', hits: '1 would-block this week' }
+    ].map((p) => ({ ...p, modeStyle: pol(p.mode) }));
+
+    const chip = (on) => 'min-height: 44px; padding: 0 14px; border-radius: 8px; font-size: 14px; ' + (on ? 'border: 2px solid ' + accent + '; background: #E8EEFB; color: #121619; font-weight: 600' : 'border: 1px solid #C9CED5; background: #FFFFFF; color: #121619');
+    const pickList = (vals, key) => vals.map((v) => ({ label: v, style: chip(s[key] === v), pick: () => this.setState({ [key]: v }) }));
+
+    return {
+      accent, openCount, nav, decisions, sel,
+      isInbox: s.view === 'inbox', isWork: s.view === 'work', isGov: s.view === 'gov',
+      events, participants, agents, policies,
+      delegations: s.delegations,
+      delegateOpen: s.delegateOpen,
+      dAgents: pickList(['KERNEL-GEN', 'FORGE', 'EVAL'], 'dAgent'),
+      dBudgets: pickList(['$20', '$50', '$100'], 'dBudget'),
+      dUntil: pickList(['Today', 'Fri', 'Dec 15'], 'dUntil'),
+      openDelegate: () => this.setState({ delegateOpen: true }),
+      closeDelegate: () => this.setState({ delegateOpen: false }),
+      confirmDelegate: () => {
+        const txt = s.dAgent + ' · until ' + s.dUntil + ' · budget ' + s.dBudget + ' · escalates on pass rate < 98%';
+        this.setState({ delegateOpen: false, delegations: [...s.delegations, txt] });
+        this.flash('Contract created. ' + s.dAgent + ' received a scoped token for this work item.');
+      },
+      hasToast: !!s.toast, toast: s.toast
+    };
+  }
+}
+</script>
+</body>
+</html>
