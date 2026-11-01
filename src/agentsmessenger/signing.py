@@ -57,7 +57,7 @@ def valid_public_key(public_b64: str) -> bool:
     try:
         Ed25519PublicKey.from_public_bytes(_unb64(public_b64))
         return True
-    except Exception:
+    except (ValueError, TypeError):
         return False
 
 
@@ -106,10 +106,10 @@ class ServerSigner:
         if not private_b64 and key_file:
             p = Path(key_file)
             if p.exists():
-                private_b64 = p.read_text().strip()
+                private_b64 = p.read_text(encoding="utf-8").strip()
             else:
                 private_b64, _ = generate_keypair()
-                p.write_text(private_b64)
+                p.write_text(private_b64, encoding="utf-8")
                 try:
                     p.chmod(0o600)
                 except OSError:

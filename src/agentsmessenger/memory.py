@@ -20,7 +20,7 @@ import json
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from .guards import GuardError, UNTRUSTED_NOTICE
+from .guards import Forbidden, GuardError, NotFound, UNTRUSTED_NOTICE
 from .models import (
     MAX_MEMORY_BYTES, AgentRecord, Envelope, MemoryItem, MemoryShare, MemoryStub, MemoryWrite, Visibility,
     estimate_tokens, utcnow,
@@ -61,8 +61,9 @@ def select_path(value: Any, path: str) -> Any:
 class MemoryMixin:
     store: "Store"
 
-    # Provided by Bus.
-    def resolve_agent(self, ref: str) -> AgentRecord: ...  # type: ignore[empty-body]
+    def resolve_agent(self, ref: str) -> AgentRecord:
+        """Provided by Bus."""
+        raise NotImplementedError(ref)
 
     # --------------------------------------------------------------- access
     def can_read_memory(self, reader_id: str | None, item: MemoryItem) -> bool:
@@ -89,7 +90,6 @@ class MemoryMixin:
     def _item(self, memory_id: str) -> MemoryItem:
         item = self.store.get_memory(memory_id)
         if not item or item.deleted:
-            from .bus import NotFound
             raise NotFound(f"no memory {memory_id!r}")
         return item
 
@@ -100,10 +100,8 @@ class MemoryMixin:
         out = sorted(set(threads))
         for t in out:
             if not self.store.get_thread(t):
-                from .bus import NotFound
                 raise NotFound(f"no thread {t!r}")
             if not self.store.is_participant(t, owner):
-                from .bus import Forbidden
                 raise Forbidden(f"you can only share memory into threads you participate in ({t})")
         return out
 
@@ -133,7 +131,6 @@ class MemoryMixin:
     def share_memory(self, agent: AgentRecord, memory_id: str, s: MemoryShare) -> MemoryItem:
         item = self._item(memory_id)
         if item.owner != agent.id:
-            from .bus import Forbidden
             raise Forbidden("only the owner can change who may read a memory item")
         if s.visibility is not None:
             item.visibility = s.visibility
@@ -149,7 +146,6 @@ class MemoryMixin:
         """Delete (owner or observer). Leaves a tombstone so `since` readers can evict their copies."""
         item = self._item(memory_id)
         if agent is not None and item.owner != agent.id:
-            from .bus import Forbidden
             raise Forbidden("only the owner (or the observer) can delete a memory item")
         item.deleted, item.value, item.shared_with, item.threads = True, None, [], []
         item.summary, item.tokens, item.updated_at = "(deleted)", 0, utcnow()
@@ -160,7 +156,6 @@ class MemoryMixin:
         item = self._item(memory_id)
         rid = reader.id if reader else None
         if not self.can_read_memory(rid, item):
-            from .bus import Forbidden
             raise Forbidden("you may not read this memory item")
         out = self._view(rid, item, full=True)
         if path:
@@ -203,10 +198,8 @@ class MemoryMixin:
         for ref in refs:
             item = self.store.get_memory(ref)
             if not item or item.deleted:
-                from .bus import NotFound
                 raise NotFound(f"no memory {ref!r}")
             if not self.can_read_memory(sender_id, item):
-                from .bus import Forbidden
                 raise Forbidden(f"you may not reference memory {ref!r}")
             if item.owner == sender_id and item.visibility == Visibility.private:
                 raise GuardError("private_memory", f"memory {ref!r} is private; make it shared or public before "

@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .guards import GuardConfig, GuardError, Guards, UNTRUSTED_NOTICE, injection_flags
+from .guards import GuardConfig, GuardError, Guards, Forbidden, NotFound, UNTRUSTED_NOTICE, injection_flags
 from .memory import MemoryMixin
 from .models import (
     AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
@@ -16,16 +16,10 @@ from .models import (
 from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
 
+__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM"]
+
 HUMAN = "human"
 SYSTEM = "system"
-
-
-class NotFound(Exception):
-    pass
-
-
-class Forbidden(Exception):
-    pass
 
 
 class Bus(MemoryMixin):

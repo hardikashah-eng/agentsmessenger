@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from .a2a import mount_a2a
 from .bus import Bus, Forbidden, NotFound
 from .guards import GuardError
 from .models import (
@@ -82,8 +83,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "agent bearer token required")
         try:
             return bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid agent token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid agent token") from exc
 
     def observer_auth(authorization: str | None = Header(None)) -> None:
         if not is_observer(_bearer(authorization)):
@@ -97,8 +98,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "bearer token required")
         try:
             return bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid token") from exc
 
     # ------------------------------------------------------------- directory
     @app.get("/health")
@@ -160,8 +161,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "agent token required")
         try:
             agent = bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid agent token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid agent token") from exc
         start = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
 
         def fetch(cursor: int) -> list[tuple[int, str, str]]:
@@ -278,7 +279,6 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     def viewer() -> str:
         return resources.files("agentsmessenger").joinpath("viewer.html").read_text(encoding="utf-8")
 
-    from .a2a import mount_a2a
     mount_a2a(app, bus)
     return app
 

@@ -1,3 +1,6 @@
+"""Core bus: routing, claims, threads, guards, observer controls and the MCP adapter."""
+# pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
+
 from fastapi.testclient import TestClient
 import pytest
 
@@ -24,7 +27,7 @@ def make():
 
 
 def test_capability_request_claim_result(make):
-    agent, obs, _ = make()
+    agent, _obs, _ = make()
     planner = agent("planner", vendor="anthropic")
     worker = agent("pdf-worker", ["pdf.extract"], vendor="openai")
     other = agent("pdf-backup", ["pdf.extract"], vendor="local")
@@ -152,5 +155,5 @@ def test_blackboard_and_directory(make):
 
 
 def test_mcp_adapter_builds():
-    from agentsmessenger.mcp_adapter import build_server
+    from agentsmessenger.mcp_adapter import build_server  # pylint: disable=import-outside-toplevel  # optional dependency
     assert build_server(Client(token="x")) is not None

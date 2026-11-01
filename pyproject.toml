@@ -30,3 +30,32 @@ packages = ["src/agentsmessenger"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+
+[tool.pylint.main]
+py-version = "3.10"
+ignore-paths = ["build", "dist"]
+
+[tool.pylint.format]
+max-line-length = 150
+
+[tool.pylint.basic]
+# Enum members are wire values (intents, states, scopes) and stay lowercase.
+class-const-naming-style = "any"
+
+[tool.pylint."messages control"]
+disable = [
+  # Docstrings are written where they help; small handlers and tests don't need them.
+  "missing-function-docstring",
+  "missing-class-docstring",
+  # Size heuristics: the bus, store and SDK are deliberately flat APIs.
+  "too-many-arguments",
+  "too-many-positional-arguments",
+  "too-many-locals",
+  "too-many-branches",
+  "too-many-statements",
+  "too-many-return-statements",
+  "too-many-public-methods",
+  "too-few-public-methods",
+  # Tests and examples repeat setup on purpose so each reads on its own.
+  "duplicate-code",
+]

@@ -1,4 +1,5 @@
 """Memory scopes (private / shared / public), sharing by reference, deltas and token budgets."""
+# pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
 
 import pytest
 from fastapi.testclient import TestClient
@@ -165,7 +166,7 @@ def test_context_pack_fits_token_budget(env):
 
 def test_signatures_unchanged_without_memory_refs(env):
     """v0.2 clients don't send memory_refs; their signatures must still verify."""
-    bus, http, agent = env
+    _, http, agent = env
     key = generate_keypair()
     s = agent("signer", key=key)
     agent("beta")

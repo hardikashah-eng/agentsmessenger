@@ -1,4 +1,5 @@
 """Phase 1: live updates (SSE), signed envelopes, A2A bridge, agent framework."""
+# pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
 
 import socket
 import threading
@@ -58,7 +59,7 @@ def test_observer_stream_and_auth(app_client):
 # ----------------------------------------------------------- signatures
 
 def test_signed_envelopes(app_client):
-    bus, http, agent = app_client
+    _, http, agent = app_client
     key = generate_keypair()
     signer = agent("signer", key=key)
     agent("beta")

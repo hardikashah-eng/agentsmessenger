@@ -189,7 +189,7 @@ class Agent:
             self.client.set_state(tid, "done")
         except HumanDeclined as ex:
             self._fail(e, f"declined by human: {ex}")
-        except Exception as ex:
+        except Exception as ex:  # pylint: disable=broad-exception-caught  # any handler error becomes an error reply
             self._fail(e, f"{type(ex).__name__}: {ex}")
 
     def _fail(self, e: dict[str, Any], reason: str) -> None:
@@ -224,14 +224,14 @@ class Agent:
 
 def _load_creds() -> dict[str, Any]:
     try:
-        return json.loads(CREDENTIALS.read_text())
+        return json.loads(CREDENTIALS.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
 
 
 def _save_creds(creds: dict[str, Any]) -> None:
     CREDENTIALS.parent.mkdir(parents=True, exist_ok=True)
-    CREDENTIALS.write_text(json.dumps(creds, indent=2))
+    CREDENTIALS.write_text(json.dumps(creds, indent=2), encoding="utf-8")
     try:
         CREDENTIALS.chmod(0o600)
     except OSError:

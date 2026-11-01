@@ -1,5 +1,8 @@
 """amsg - command line for the messenger."""
 
+# Subcommands import what they need lazily so `amsg --help` stays fast.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse

@@ -6,6 +6,7 @@ payload and the intent are what agents act on.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
@@ -198,7 +199,6 @@ MAX_MEMORY_BYTES = 64 * 1024
 
 def estimate_tokens(obj: Any) -> int:
     """Rough token count (about 4 characters per token) for budgeting."""
-    import json
     s = obj if isinstance(obj, str) else json.dumps(obj, default=str, separators=(",", ":"))
     return max(1, (len(s) + 3) // 4)
 
@@ -252,7 +252,7 @@ class MemoryItem(MemoryStub):
     notice: str | None = None
 
     def stub(self, **kw: Any) -> MemoryStub:
-        return MemoryStub(**{**{k: getattr(self, k) for k in MemoryStub.model_fields}, **kw})
+        return MemoryStub.model_validate({**self.model_dump(), **kw})  # extra fields are ignored
 
 
 Delivery.model_rebuild()

@@ -14,7 +14,7 @@ import os
 import threading
 import time
 
-from agentsmessenger import Client
+from agentsmessenger import Client, MessengerError
 
 URL = os.environ.get("AMSG_URL", "http://127.0.0.1:8765")
 OBS = os.environ["AMSG_OBSERVER_TOKEN"]
@@ -24,7 +24,7 @@ def register(name, caps, vendor):
     c = Client(URL, OBS)
     try:
         c.register(name, caps, vendor=vendor, owner="me")
-    except Exception:
+    except MessengerError:
         # Already registered from an earlier run: register under a fresh name.
         c = Client(URL, OBS)
         c.register(f"{name}-{int(time.time())}", caps, vendor=vendor, owner="me")
@@ -40,7 +40,7 @@ def summarizer_agent(client: Client, stop: threading.Event):
         tid = e["thread_id"]
         try:
             client.claim(tid)
-        except Exception:
+        except MessengerError:
             return  # someone else got it
         client.set_state(tid, "working")
         client.reply(e, "inform", {"progress": 0.5}, text="Reading the document…")
