@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quorum mobile decision</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+button{font-family:inherit;cursor:pointer}
+</style>
+</helmet>
+<div style="width: 390px; height: 844px; box-sizing: border-box; padding: 24px 18px; background: #F4F5F7; font-family: 'IBM Plex Sans', system-ui, sans-serif; color: #121619; display: flex; flex-direction: column; gap: 14px; font-size: 14px; line-height: 1.45">
+<div style="display: flex; justify-content: space-between; align-items: center">
+<div style="font-weight: 700; font-size: 17px">Decisions</div>
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; padding: 2px 8px; border-radius: 10px; background: #121619; color: #F4F5F7">{{countLabel}}</span>
+</div>
+
+<sc-if value="{{open}}" hint-placeholder-val="{{true}}">
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 14px; padding: 18px; display: flex; flex-direction: column; gap: 12px">
+<div style="display: flex; justify-content: space-between; align-items: center">
+<span style="font-family: 'IBM Plex Mono', monospace; font-size: 12px; font-weight: 500; padding: 2px 8px; border-radius: 4px; border: 1.5px solid #1F5FD1">SIM-VAL</span>
+<span style="font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; background: #FDF1DC; color: #7A4A00">Medium risk</span>
+</div>
+<div style="font-size: 12px; color: #525B66">For Wei · Sim fidelity regression · due 10:00 PM</div>
+<h1 style="margin: 0; font-size: 20px; line-height: 1.25">Exceed budget by $140 to re-run 1,200 scenarios</h1>
+<p style="margin: 0; color: #2A3036">Cut-in pass rate fell from 99.1% to 96.4% after last night's build. The agent traced it to the lidar noise-model change.</p>
+<div style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px">
+<div style="border: 1px solid #DDE1E6; border-radius: 8px; padding: 8px 10px"><div style="font-size: 11px; color: #525B66; text-transform: uppercase; letter-spacing: 0.06em">Reversible</div><div style="font-weight: 500">No · spend</div></div>
+<div style="border: 1px solid #DDE1E6; border-radius: 8px; padding: 8px 10px"><div style="font-size: 11px; color: #525B66; text-transform: uppercase; letter-spacing: 0.06em">Confidence</div><div style="font-weight: 500">0.78</div></div>
+</div>
+<div style="font-size: 13px; color: #525B66">If you don't respond: <strong style="color: #121619">runs the top 300 only</strong></div>
+</div>
+<div style="margin-top: auto; display: flex; flex-direction: column; gap: 8px">
+<button onClick="{{approve}}" style="height: 52px; border-radius: 10px; border: none; background: #1F5FD1; color: #FFFFFF; font-size: 16px; font-weight: 600">Approve $140</button>
+<button onClick="{{partial}}" style="height: 52px; border-radius: 10px; border: 1px solid #C9CED5; background: #FFFFFF; color: #121619; font-size: 16px">Top 300 only ($35)</button>
+<button onClick="{{decline}}" style="height: 44px; border-radius: 10px; border: none; background: transparent; color: #8A2E07; font-size: 15px">Decline</button>
+</div>
+</sc-if>
+
+<sc-if value="{{done}}" hint-placeholder-val="{{false}}">
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 14px; padding: 22px 18px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start">
+<svg width="36" height="36" viewBox="0 0 36 36" aria-hidden="true"><circle cx="18" cy="18" r="16" fill="#E7F3EC"></circle><path d="M10 18.5l5 5 11-12" fill="none" stroke="#14532D" stroke-width="2.5"></path></svg>
+<h1 style="margin: 0; font-size: 20px">{{outcome}}</h1>
+<p style="margin: 0; color: #2A3036">Co-signed by you and written to the work item's trace. SIM-VAL has a scoped token for this run only.</p>
+<button onClick="{{undo}}" style="height: 44px; padding: 0 14px; border-radius: 8px; border: 1px solid #C9CED5; background: #FFFFFF; color: #121619; font-size: 14px">Undo (2 min window)</button>
+</div>
+<div style="background: #FFFFFF; border: 1px solid #DDE1E6; border-radius: 14px; padding: 14px 18px; display: flex; flex-direction: column; gap: 4px">
+<div style="font-size: 12px; color: #525B66">Next</div>
+<div style="font-weight: 600">Merge MR !4821 into compiler/main</div>
+<div style="font-size: 12px; color: #525B66">FORGE · medium risk · due 6:00 PM</div>
+</div>
+<div style="font-size: 13px; color: #525B66; padding: 0 4px">While you were away: 41 agent events, 0 policy breaches, $118 spent across 5 agents.</div>
+</sc-if>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":390,"height":844}}'>
+class Component extends DCLogic {
+  constructor(props) { super(props); this.state = { outcome: '' }; }
+  renderVals() {
+    const o = this.state.outcome;
+    return {
+      open: !o, done: !!o, outcome: o,
+      countLabel: o ? '4 left' : '5 need you',
+      approve: () => this.setState({ outcome: 'Approved $140' }),
+      partial: () => this.setState({ outcome: 'Running the top 300 only' }),
+      decline: () => this.setState({ outcome: 'Declined' }),
+      undo: () => this.setState({ outcome: '' })
+    };
+  }
+}
+</script>
+</body>
+</html>

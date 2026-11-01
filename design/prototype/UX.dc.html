@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Quorum UX model</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap">
+<style>
+body{margin:0}
+</style>
+</helmet>
+<div style="width: 1440px; height: 900px; box-sizing: border-box; padding: 56px 64px; background: #FFFFFF; font-family: 'IBM Plex Sans', system-ui, sans-serif; color: #121619; display: flex; flex-direction: column; gap: 36px; font-size: 15px; line-height: 1.45">
+<div>
+<div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">UX model</div>
+<h1 style="margin: 4px 0 0; font-size: 36px; letter-spacing: -0.02em">Chat is a view. The work object is the substrate.</h1>
+</div>
+
+<div style="display: flex; flex-direction: column; gap: 14px">
+<div style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #525B66">Object model</div>
+<div style="display: flex; align-items: center; gap: 0">
+<div style="width: 220px; padding: 16px; border-radius: 10px; border: 2px solid #121619"><div style="font-weight: 600">Principal</div><div style="font-size: 13px; color: #525B66">Human, agent or service. Agents act on behalf of a human via scoped, expiring tokens.</div></div>
+<div style="flex: 1; height: 2px; background: #121619; position: relative"><div style="position: absolute; right: -1px; top: -5px; width: 0; height: 0; border-left: 9px solid #121619; border-top: 6px solid transparent; border-bottom: 6px solid transparent"></div></div>
+<div style="width: 220px; padding: 16px; border-radius: 10px; border: 2px solid #1F5FD1; background: #E8EEFB"><div style="font-weight: 600">Work item</div><div style="font-size: 13px; color: #2A3036">Goal, owner, budget, deadline, participants, artifacts.</div></div>
+<div style="flex: 1; height: 2px; background: #121619; position: relative"><div style="position: absolute; right: -1px; top: -5px; width: 0; height: 0; border-left: 9px solid #121619; border-top: 6px solid transparent; border-bottom: 6px solid transparent"></div></div>
+<div style="width: 220px; padding: 16px; border-radius: 10px; border: 2px solid #121619"><div style="font-weight: 600">Event</div><div style="font-size: 13px; color: #525B66">Typed: plan, tool call, eval, policy match, human note. Prose is a rendering.</div></div>
+<div style="flex: 1; height: 2px; background: #121619; position: relative"><div style="position: absolute; right: -1px; top: -5px; width: 0; height: 0; border-left: 9px solid #121619; border-top: 6px solid transparent; border-bottom: 6px solid transparent"></div></div>
+<div style="width: 220px; padding: 16px; border-radius: 10px; border: 2px solid #B4460B; background: #FDF1DC"><div style="font-weight: 600">Decision request</div><div style="font-size: 13px; color: #2A3036">The only thing that interrupts a human. Has options and a default.</div></div>
+</div>
+<div style="display: flex; gap: 16px; padding-left: 240px">
+<div style="flex: 1; padding: 12px 16px; border-radius: 10px; border: 1.5px dashed #121619; font-size: 14px"><strong>Policy</strong> sits on every event: allow, escalate, hold, or block — before the tool call runs, not after.</div>
+<div style="flex: 1; padding: 12px 16px; border-radius: 10px; border: 1.5px dashed #121619; font-size: 14px"><strong>Trace</strong> keeps every event, signature and token, so any decision can be replayed and bisected.</div>
+</div>
+</div>
+
+<div style="display: flex; flex-direction: column; gap: 14px">
+<div style="font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: #525B66">Five UX principles</div>
+<div style="display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 16px">
+<div style="padding: 18px; border-radius: 10px; background: #F4F5F7; display: flex; flex-direction: column; gap: 6px"><div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">01</div><div style="font-weight: 600; font-size: 17px">Attention is the budget</div><div style="font-size: 14px; color: #2A3036">Rank by "only you can decide this". Digest everything else.</div></div>
+<div style="padding: 18px; border-radius: 10px; background: #F4F5F7; display: flex; flex-direction: column; gap: 6px"><div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">02</div><div style="font-weight: 600; font-size: 17px">Every ask is decidable</div><div style="font-size: 14px; color: #2A3036">Evidence, reversibility, blast radius, cost, and what happens if ignored.</div></div>
+<div style="padding: 18px; border-radius: 10px; background: #F4F5F7; display: flex; flex-direction: column; gap: 6px"><div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">03</div><div style="font-weight: 600; font-size: 17px">Provenance is visible</div><div style="font-size: 14px; color: #2A3036">Circles are people, squares are agents, and every agent shows who it acts for.</div></div>
+<div style="padding: 18px; border-radius: 10px; background: #F4F5F7; display: flex; flex-direction: column; gap: 6px"><div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">04</div><div style="font-weight: 600; font-size: 17px">Delegation is a contract</div><div style="font-size: 14px; color: #2A3036">Scope, budget, deadline and escalation, set in one gesture.</div></div>
+<div style="padding: 18px; border-radius: 10px; background: #F4F5F7; display: flex; flex-direction: column; gap: 6px"><div style="font-family: 'IBM Plex Mono', monospace; font-size: 13px; color: #525B66">05</div><div style="font-weight: 600; font-size: 17px">Autonomy is earned</div><div style="font-size: 14px; color: #2A3036">Tiers move with eval evidence; quarantine is one click.</div></div>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"$preview":{"width":1440,"height":900}}'>
+class Component extends DCLogic {
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>
