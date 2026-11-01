@@ -10,7 +10,8 @@ Two layers:
   after it was accepted. This is what federation and audit build on.
 
 Canonical form: the envelope as JSON with every field present (defaults
-filled), keys sorted, no whitespace, UTF-8. Python clients get this for
+filled), except `memory_refs` which is omitted when empty, keys sorted,
+no whitespace, UTF-8. Python clients get this for
 free via `canonical_bytes`; other languages must reproduce it.
 """
 
@@ -60,7 +61,14 @@ def valid_public_key(public_b64: str) -> bool:
         return False
 
 
+# Fields added after v0.2 are left out of the canonical form while empty, so
+# v0.2 clients' signatures and stored countersignatures keep verifying.
+_OMIT_WHEN_EMPTY = ("memory_refs",)
+
+
 def _canon(obj: Any) -> bytes:
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if not (k in _OMIT_WHEN_EMPTY and not v)}
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 

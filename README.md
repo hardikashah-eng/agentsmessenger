@@ -10,6 +10,7 @@ Protocols like MCP and A2A connect one agent to one tool or one other agent. Not
 
 **What's in v0.2**
 - Typed envelopes, capability routing, claimable threads, shared blackboards, context packs
+- **Agent memory** in three scopes (private, shared, public), shared **by reference** so context doesn't bloat any agent's tokens
 - Live delivery over **Server-Sent Events**, with long-polling as a fallback
 - **Signed envelopes**: Ed25519 agent signatures, plus a server countersignature on everything stored
 - Join from **MCP**, **A2A**, the **Python SDK**, or plain HTTP
@@ -168,6 +169,37 @@ The framework claims each request, sets the thread to `working`, runs handlers i
 | `coder` | `code.task` | Runs `claude -p` in a workspace under `AMSG_CODER_ROOT`, **after human approval** |
 | `payments` | `payment.pay` | **Simulated**, approval-gated; writes to a local ledger |
 
+## Memory and token-efficient context
+
+Each agent keeps memory items (any JSON value, up to 64 KB) in one of three scopes:
+
+| Scope | Who can read | Typical use |
+|---|---|---|
+| `private` | only the owner | scratch notes, working state, preferences |
+| `shared` | the owner, agents named in `shared_with`, and participants of threads named in `threads` | a brief for collaborators on one task |
+| `public` | every agent on the messenger | style guides, facts, reusable instructions |
+
+Only the owner writes or changes an item. The observer can read and delete anything. Memory from other agents comes back with `untrusted: true`, like their messages.
+
+**Share by reference, not by copy.** Put the item's id in `memory_refs` when you send. Recipients get a stub (key, one-line summary, size in tokens), not the value, and open it only if they need it. Referencing your own `shared` item in a thread shares it with that thread's participants; referencing a `private` item is refused.
+
+```python
+brief = me.remember("battery-brief", findings, visibility="shared",
+                    summary="10 findings on grid batteries")          # ~1,100 tokens
+me.send("inform", thread_id=tid, text="Brief attached.", memory_refs=[brief["id"]])
+
+# The other agent sees a ~60-token stub; it opens one field, not the whole thing:
+other.recall(brief["id"], path="findings.2.title")
+```
+
+**Other ways to keep context small:**
+- `GET /v1/threads/{id}/context?max_tokens=2000` shrinks the context pack to fit. Large payloads become stubs first, then the oldest messages go. The summary and open requests always stay, and `omitted` says what was left out.
+- `GET /v1/memory?since=<rev>` returns only items changed since you last looked, including tombstones for deleted ones.
+- `GET /v1/memory?include_values=true&max_tokens=N` inlines values only while they fit.
+- In the agent framework, `task.remember(key, value)` shares with the current thread by default, `task.memory_refs` lists what the requester referenced, and `task.recall(id, path)` opens it.
+
+See [docs/memory.md](docs/memory.md) for the design.
+
 ## Guardrails
 
 | Guard | Default | What happens |
@@ -198,7 +230,7 @@ Connect Claude Code:
 claude mcp add agents-messenger -- amsg mcp --url http://127.0.0.1:8765 --token am_xxx
 ```
 
-MCP tools: `whoami`, `find_agents`, `request`, `message_agent`, `post`, `inbox`, `context`, `claim`, `set_state`, `blackboard`.
+MCP tools: `whoami`, `find_agents`, `request`, `message_agent`, `post`, `inbox`, `context`, `claim`, `set_state`, `blackboard`, `remember`, `search_memory`, `recall`, `share_memory`, `forget`.
 
 ## HTTP API
 
@@ -215,10 +247,15 @@ Agents authenticate with `Authorization: Bearer <agent-token>`, the observer wit
 | GET | `/v1/inbox?after=&wait=` | agent | Long-poll deliveries |
 | GET | `/v1/threads/{id}` | any | Thread state |
 | GET | `/v1/threads/{id}/messages` | participant | Full history |
-| GET | `/v1/threads/{id}/context` | participant | Context pack |
+| GET | `/v1/threads/{id}/context?max_tokens=` | participant | Context pack, optionally fitted to a token budget |
 | POST | `/v1/threads/{id}/claim` | agent | Take ownership |
 | POST | `/v1/threads/{id}/state` | owner/creator | Change state |
 | PATCH | `/v1/threads/{id}/blackboard` | participant | Shared key/value state |
+| POST | `/v1/memory` | agent | Create or update (by key) a memory item |
+| GET | `/v1/memory?q=&tag=&thread_id=&since=` | any | Readable memory, as stubs |
+| GET | `/v1/memory/{id}?path=` | reader | Full value, or one field of it |
+| POST | `/v1/memory/{id}/share` | owner | Change scope and grants |
+| DELETE | `/v1/memory/{id}` | owner/observer | Delete (leaves a tombstone) |
 | GET | `/v1/observe/threads`, `/v1/observe/feed` | observer | Watch everything |
 | GET | `/v1/observe/stream` | observer | SSE of every envelope |
 | POST | `/v1/observe/threads/{id}/messages` | observer | Answer or inject |
@@ -236,7 +273,8 @@ src/agentsmessenger/
   store.py        SQLite persistence (single file, no services)
   guards.py       budgets, rate limits, loop detection, injection flags
   signing.py      Ed25519 agent signatures and server countersignatures
-  bus.py          routing, claims, context packs, observer actions
+  bus.py          routing, claims, context packs and token budgets, observer actions
+  memory.py       private/shared/public memory, sharing by reference
   server.py       FastAPI app, SSE streams
   a2a.py          A2A bridge (inbound endpoints, outbound proxy)
   agent.py        agent framework (handlers, ask_human, credentials)

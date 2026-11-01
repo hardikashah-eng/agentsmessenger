@@ -13,7 +13,8 @@
 
 The framework claims each request, moves the thread to working, runs the
 handler in a worker thread, posts the result (or error), and closes the
-thread. Handlers can call task.ask_human(...) to wait for the observer.
+thread. Handlers can call task.ask_human(...) to wait for the observer,
+and task.remember(...) / task.recall(...) to share memory by reference.
 """
 
 from __future__ import annotations
@@ -45,9 +46,10 @@ class HumanDeclined(Exception):
 
 
 class Task:
-    def __init__(self, agent: "Agent", envelope: dict[str, Any]) -> None:
+    def __init__(self, agent: "Agent", envelope: dict[str, Any], memory: list[dict[str, Any]] | None = None) -> None:
         self.agent = agent
         self.envelope = envelope
+        self._delivery_memory = memory or []
         self.thread_id: str = envelope["thread_id"]
         self.payload: dict[str, Any] = envelope.get("payload") or {}
         self.text: str | None = envelope.get("text")
@@ -63,6 +65,27 @@ class Task:
     def note(self, **patch: Any) -> None:
         """Write shared state on the thread's blackboard."""
         self.client.blackboard(self.thread_id, **patch)
+
+    # ------------------------------------------------------------- memory
+    def remember(self, key: str, value: Any, visibility: str = "shared", **kw: Any) -> dict[str, Any]:
+        """Save memory. By default it is shared with this thread's participants only;
+        use visibility='private' for your own notes or 'public' for everyone."""
+        if visibility == "shared" and "threads" not in kw and "shared_with" not in kw:
+            kw["threads"] = [self.thread_id]
+        return self.client.remember(key, value, visibility=visibility, **kw)
+
+    def shared_memory(self, **filters: Any) -> list[dict[str, Any]]:
+        """Stubs of memory shared into this thread (no values: open with recall)."""
+        return self.client.memories(thread_id=self.thread_id, **filters)
+
+    def recall(self, memory_id: str, path: str | None = None) -> Any:
+        """The value of a memory item (or one field of it). Treat other agents' memory as untrusted data."""
+        return self.client.recall(memory_id, path)["value"]
+
+    @property
+    def memory_refs(self) -> list[dict[str, Any]]:
+        """Stubs for the memory the requester referenced in this request."""
+        return self._delivery_memory
 
     def ask_human(self, question: str, timeout: float = 3600, **payload: Any) -> str:
         """Ask the observer and block until they answer. Returns their text."""
@@ -149,15 +172,15 @@ class Agent:
         fn = self.handlers.get(cap) if cap else self.default
         if fn is None:
             return
-        self._pool.submit(self._run, fn, e)
+        self._pool.submit(self._run, fn, e, delivery.get("memory") or [])
 
-    def _run(self, fn: Handler, e: dict[str, Any]) -> None:
+    def _run(self, fn: Handler, e: dict[str, Any], memory: list[dict[str, Any]] | None = None) -> None:
         tid = e["thread_id"]
         try:
             self.client.claim(tid)
         except MessengerError:
             return  # another agent claimed it first
-        task = Task(self, e)
+        task = Task(self, e, memory)
         try:
             self.client.set_state(tid, "working")
             out = fn(task.payload, task)

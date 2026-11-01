@@ -8,9 +8,10 @@ from __future__ import annotations
 from typing import Any
 
 from .guards import GuardConfig, GuardError, Guards, UNTRUSTED_NOTICE, injection_flags
+from .memory import MemoryMixin
 from .models import (
     AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
-    Thread, ThreadState, TRANSITIONS, TERMINAL,
+    Thread, ThreadState, TRANSITIONS, TERMINAL, estimate_tokens,
 )
 from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
@@ -27,7 +28,7 @@ class Forbidden(Exception):
     pass
 
 
-class Bus:
+class Bus(MemoryMixin):
     def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None,
                  signer: ServerSigner | None = None, require_signatures: bool = False) -> None:
         self.store = store or Store()
@@ -110,6 +111,9 @@ class Bus:
             if sender and sender.id not in thread.participants and not self._can_join(sender, thread):
                 raise Forbidden("not a participant of this thread")
 
+        if env.memory_refs:
+            self.check_memory_refs(sender.id if sender else None, env.memory_refs)
+
         if sender is not None:
             self.guards.check_send(sender_id, sender.paused, env, thread)
         elif thread is not None and thread.state in TERMINAL:
@@ -135,6 +139,8 @@ class Bus:
             self.store.add_participant(thread, sender.id)
         if to_agent:
             self.store.add_participant(thread, to_agent.id)
+        if stored.memory_refs:
+            self.grant_refs_to_thread(sender.id if sender else None, stored)
         thread = self._thread(thread.id)
 
         if env.intent == Intent.ask_human:
@@ -225,7 +231,9 @@ class Bus:
         if untrusted:
             flags = injection_flags(env)
             notice = UNTRUSTED_NOTICE + (f" Flagged phrases: {', '.join(flags)}." if flags else "")
-        return Delivery(envelope=env, untrusted=untrusted, notice=notice)
+        rid = None if reader_id == HUMAN else reader_id
+        memory = self.memory_stubs_for(rid, env.memory_refs) if env.memory_refs else []
+        return Delivery(envelope=env, untrusted=untrusted, notice=notice, memory=memory)
 
     def inbox(self, agent: AgentRecord, after: int = 0, limit: int = 100) -> list[Delivery]:
         return [self.deliver(agent.id, e) for e in self.store.inbox(agent.id, after, limit)]
@@ -237,7 +245,8 @@ class Bus:
         rid = reader.id if reader else HUMAN
         return [self.deliver(rid, e) for e in self.store.thread_messages(thread_id, after)]
 
-    def context_pack(self, reader: AgentRecord | None, thread_id: str, recent: int = 10) -> ContextPack:
+    def context_pack(self, reader: AgentRecord | None, thread_id: str, recent: int = 10,
+                     max_tokens: int | None = None) -> ContextPack:
         t = self._thread(thread_id)
         if reader is not None and reader.id not in t.participants and not self._can_join(reader, t):
             raise Forbidden("not a participant of this thread")
@@ -260,10 +269,21 @@ class Bus:
         if t.blackboard:
             lines.append("Blackboard keys: " + ", ".join(sorted(t.blackboard)) + ".")
         rid = reader.id if reader else HUMAN
-        return ContextPack(
+        # Memory shared into the thread, plus anything referenced in it that this reader may open.
+        mid = reader.id if reader else None
+        memory = [self._view(mid, m, full=False).stub()
+                  for m in self.store.visible_memory(mid, thread_id=thread_id, limit=50)]
+        seen = {m.id for m in memory}
+        refs = [r for e in reversed(msgs) for r in e.memory_refs if r not in seen]
+        memory += [s for s in self.memory_stubs_for(mid, list(dict.fromkeys(refs))[:50]) if s.accessible]
+        if memory:
+            lines.append(f"Shared memory: {len(memory)} items (stubs below; open with GET /v1/memory/{{id}}).")
+        pack = ContextPack(
             thread=t, summary=" ".join(lines), open_requests=open_requests, latest_results=results,
-            recent=[self.deliver(rid, m) for m in msgs[-recent:]], notice=UNTRUSTED_NOTICE,
+            recent=[self.deliver(rid, m) for m in msgs[-recent:]] if recent > 0 else [],
+            memory=memory, notice=UNTRUSTED_NOTICE, max_tokens=max_tokens,
         )
+        return fit_to_budget(pack, max_tokens) if max_tokens else _measured(pack)
 
     # --------------------------------------------------------------- human
     def human_pause_agent(self, agent_ref: str, paused: bool) -> AgentRecord:
@@ -277,3 +297,59 @@ class Bus:
             return self.set_state(None, thread_id, ThreadState.paused, reason or "paused by observer")
         target = ThreadState.working if t.owner else ThreadState.open
         return self.set_state(None, thread_id, target)
+
+
+# ---------------------------------------------------------- token budgets
+
+CLIP_MIN_TOKENS = 50  # payloads at least this large may be replaced by stubs
+
+
+def _measured(pack: ContextPack) -> ContextPack:
+    pack.tokens_estimate = estimate_tokens(pack.model_dump_json())
+    return pack
+
+
+def _clip(env: Envelope) -> Envelope:
+    keys = list(env.payload)[:10]
+    return env.model_copy(update={
+        "payload": {"_clipped": True, "keys": keys, "tokens": estimate_tokens(env.payload)},
+        "text": (env.text[:200] + "...") if env.text and len(env.text) > 200 else env.text,
+    })
+
+
+def fit_to_budget(pack: ContextPack, max_tokens: int) -> ContextPack:
+    """Shrink a context pack until it fits, cheapest losses first:
+    1. replace large payloads in recent messages with stubs (keys + size),
+    2. drop the oldest recent messages,
+    3. clip large payloads in open requests and latest results,
+    4. drop memory stubs beyond the newest five.
+    The thread summary and the open requests themselves are always kept."""
+    omitted: dict[str, int] = {}
+
+    def size() -> int:
+        return _measured(pack).tokens_estimate
+
+    if size() <= max_tokens:
+        return pack
+    for d in sorted(pack.recent, key=lambda d: -estimate_tokens(d.envelope.payload)):
+        if size() <= max_tokens:
+            break
+        if not d.clipped and estimate_tokens(d.envelope.payload) > CLIP_MIN_TOKENS:
+            d.envelope, d.clipped = _clip(d.envelope), True
+            omitted["clipped_payloads"] = omitted.get("clipped_payloads", 0) + 1
+    while pack.recent and size() > max_tokens:
+        pack.recent.pop(0)
+        omitted["recent_messages"] = omitted.get("recent_messages", 0) + 1
+    for group in (pack.latest_results, pack.open_requests):
+        for i, e in enumerate(group):
+            if size() <= max_tokens:
+                break
+            if estimate_tokens(e.payload) > CLIP_MIN_TOKENS and not e.payload.get("_clipped"):
+                group[i] = _clip(e)
+                omitted["clipped_payloads"] = omitted.get("clipped_payloads", 0) + 1
+    while len(pack.memory) > 5 and size() > max_tokens:
+        pack.memory.pop()
+        omitted["memory_stubs"] = omitted.get("memory_stubs", 0) + 1
+    pack.truncated = bool(omitted)
+    pack.omitted = omitted
+    return _measured(pack)

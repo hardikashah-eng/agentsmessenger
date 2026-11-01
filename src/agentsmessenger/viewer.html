@@ -111,15 +111,28 @@ async function renderThread(id) {
         t.state !== "done" && t.state !== "failed" ? el("button", { class: paused ? "" : "warn", onclick: async () => { await api(`/v1/observe/threads/${id}/${paused ? "resume" : "pause"}`, { method: "POST", body: "{}" }); refresh(); } }, paused ? "Resume thread" : "Pause thread") : null)),
     el("p", { class: "muted" }, ctx.summary));
   if (Object.keys(t.blackboard).length) box.append(el("h2", {}, "Blackboard"), el("pre", {}, JSON.stringify(t.blackboard, null, 2)));
+  if (ctx.memory && ctx.memory.length) {
+    box.append(el("h2", { style: "margin-top:12px" }, "Shared memory"));
+    for (const m of ctx.memory) {
+      const val = el("pre", { hidden: "" });
+      box.append(el("div", { class: "msg" },
+        el("div", { class: "head" }, el("span", { class: "badge", title: "private · shared · public" }, m.visibility),
+          el("strong", { class: "mono" }, m.key), el("span", { class: "muted" }, "by " + (names[m.owner] || m.owner)),
+          el("span", { class: "mono muted" }, "v" + m.version + " · ~" + m.tokens + " tokens"),
+          el("button", { onclick: async () => { if (val.hidden && !val.textContent) val.textContent = JSON.stringify((await api(`/v1/memory/${m.id}`)).value, null, 2); val.toggleAttribute("hidden"); } }, "Open")),
+        el("div", { style: "margin-top:4px" }, m.summary), val));
+    }
+  }
   box.append(el("h2", { style: "margin-top:12px" }, "Messages"));
   for (const d of msgs) {
-    const e = d.envelope; const det = el("pre", { hidden: "" }, JSON.stringify({ intent: e.intent, to: e.to, payload: e.payload, artifacts: e.artifacts, cost_usd: e.cost_usd, in_reply_to: e.in_reply_to }, null, 2));
+    const e = d.envelope; const det = el("pre", { hidden: "" }, JSON.stringify({ intent: e.intent, to: e.to, payload: e.payload, artifacts: e.artifacts, memory_refs: e.memory_refs, cost_usd: e.cost_usd, in_reply_to: e.in_reply_to }, null, 2));
     box.append(el("div", { class: "msg" },
       el("div", { class: "head" }, el("span", { class: "mono muted" }, "#" + e.seq), el("span", { class: "badge" }, e.intent),
         el("strong", {}, names[e.sender] || e.sender), e.to.capability ? el("span", { class: "muted" }, "→ " + e.to.capability) : null,
         e.to.agent ? el("span", { class: "muted" }, "→ " + (names[e.to.agent] || e.to.agent)) : null,
         e.cost_usd ? el("span", { class: "mono muted" }, "$" + e.cost_usd.toFixed(3)) : null,
         e.verified ? el("span", { class: "badge", title: "Signature verified against the sender's registered key" }, "signed ✓") : null,
+        e.memory_refs && e.memory_refs.length ? el("span", { class: "badge", title: "Shared memory by reference" }, "memory ×" + e.memory_refs.length) : null,
         el("button", { onclick: () => det.toggleAttribute("hidden") }, "Envelope")),
       el("div", { style: "margin-top:4px;white-space:pre-wrap" }, e.text || el("span", { class: "muted" }, "(no prose; see envelope)")),
       d.notice && d.notice.includes("Flagged") ? el("div", { class: "flag" }, d.notice.split("Flagged phrases:")[1] ? "Possible injection: " + d.notice.split("Flagged phrases:")[1] : "") : null,

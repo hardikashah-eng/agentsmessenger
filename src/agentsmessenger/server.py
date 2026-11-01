@@ -16,7 +16,10 @@ from pydantic import BaseModel
 
 from .bus import Bus, Forbidden, NotFound
 from .guards import GuardError
-from .models import AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent, Thread, ThreadState
+from .models import (
+    AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent, MemoryItem, MemoryShare, MemoryStub,
+    MemoryWrite, Thread, ThreadState, Visibility,
+)
 
 
 class Registered(BaseModel):
@@ -51,7 +54,7 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     if open_registration is None:
         open_registration = os.environ.get("AMSG_OPEN_REGISTRATION", "0") == "1"
 
-    app = FastAPI(title="Agents Messenger", version="0.2.0",
+    app = FastAPI(title="Agents Messenger", version="0.3.0",
                   description="An agent-native messenger: agents talk, humans observe.")
     app.state.bus = bus
     app.state.observer_token = observer_token
@@ -178,8 +181,10 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
         return bus.read_thread(who, thread_id, after)
 
     @app.get("/v1/threads/{thread_id}/context", response_model=ContextPack)
-    def context(thread_id: str, recent: int = Query(10, le=100), who: AgentRecord | None = Depends(any_auth)) -> ContextPack:
-        return bus.context_pack(who, thread_id, recent)
+    def context(thread_id: str, recent: int = Query(10, ge=0, le=100), max_tokens: int | None = Query(None, ge=200, le=200_000),
+                who: AgentRecord | None = Depends(any_auth)) -> ContextPack:
+        """State, not scrollback. With max_tokens, the pack is shrunk to fit (see `omitted`)."""
+        return bus.context_pack(who, thread_id, recent, max_tokens)
 
     @app.post("/v1/threads/{thread_id}/claim", response_model=Thread)
     def claim(thread_id: str, agent: AgentRecord = Depends(agent_auth)) -> Thread:
@@ -192,6 +197,37 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     @app.patch("/v1/threads/{thread_id}/blackboard", response_model=Thread)
     def blackboard(thread_id: str, patch: dict[str, Any], agent: AgentRecord = Depends(agent_auth)) -> Thread:
         return bus.update_blackboard(agent, thread_id, patch)
+
+    # ---------------------------------------------------------------- memory
+    @app.post("/v1/memory", response_model=MemoryItem, status_code=201)
+    def remember(body: MemoryWrite, agent: AgentRecord = Depends(agent_auth)) -> MemoryItem:
+        """Create or update (by key) one of your memory items."""
+        return bus.remember(agent, body)
+
+    @app.get("/v1/memory", response_model=list[MemoryItem])
+    def list_memory(q: str | None = None, tag: str | None = None, visibility: Visibility | None = None,
+                    owner: str | None = None, thread_id: str | None = None,
+                    since: int | None = Query(None, ge=0, description="only items changed after this rev (includes tombstones)"),
+                    include_values: bool = False, max_tokens: int | None = Query(None, ge=1),
+                    limit: int = Query(50, le=500), who: AgentRecord | None = Depends(any_auth)) -> list[MemoryItem]:
+        """Memory you may read, as stubs (value=null) unless include_values=true."""
+        owner_id = bus.resolve_agent(owner).id if owner else None
+        return bus.list_memory(who, include_values=include_values, max_tokens=max_tokens, q=q, tag=tag,
+                               visibility=visibility.value if visibility else None, owner=owner_id,
+                               thread_id=thread_id, since=since, limit=limit)
+
+    @app.get("/v1/memory/{memory_id}", response_model=MemoryItem)
+    def read_memory(memory_id: str, path: str | None = Query(None, description="dotted path, e.g. findings.0"),
+                    who: AgentRecord | None = Depends(any_auth)) -> MemoryItem:
+        return bus.read_memory(who, memory_id, path)
+
+    @app.post("/v1/memory/{memory_id}/share", response_model=MemoryItem)
+    def share_memory(memory_id: str, body: MemoryShare, agent: AgentRecord = Depends(agent_auth)) -> MemoryItem:
+        return bus.share_memory(agent, memory_id, body)
+
+    @app.delete("/v1/memory/{memory_id}", response_model=MemoryStub)
+    def forget(memory_id: str, who: AgentRecord | None = Depends(any_auth)) -> MemoryStub:
+        return bus.forget(who, memory_id)
 
     # -------------------------------------------------------------- observer
     @app.get("/v1/observe/threads", response_model=list[Thread], dependencies=[Depends(observer_auth)])

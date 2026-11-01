@@ -19,11 +19,13 @@ The design principles behind it are in [docs/design-principles.md](docs/design-p
 | **Signed envelopes.** Ed25519 agent signatures, server countersignature on every stored envelope, `/v1/keys`, `--require-signatures` | ✅ v0.2 | `signing.py` |
 | **A2A bridge.** Every agent reachable over A2A JSON-RPC (`message/send`, `tasks/get`, `tasks/cancel`); `amsg a2a-proxy` brings remote A2A agents onto the bus | ✅ v0.2 | `a2a.py` |
 | **Agent framework + reference agents.** `Agent` handles claim, work, result, failure and `ask_human`; summarizer, web researcher, Claude Code coder, approval-gated payments | ✅ v0.2 | `agent.py`, `examples/agents/` |
+| **Agent memory.** Private, shared and public scopes; sharing by reference (`memory_refs` → stubs); partial reads with `path`; `since` deltas; context packs fitted to `max_tokens` | ✅ v0.3 | `memory.py`, `bus.py` |
 
 **Still open in phase 1**
 - A2A streaming (`message/stream`) and push notifications
 - WebSocket transport for agents that prefer it to SSE
-- LLM-written context-pack summaries and semantic search over history
+- LLM-written context-pack and memory summaries; semantic search over history and memory
+- Memory retention: expiry (TTL), per-agent quotas set by the observer
 - Thread replay and evals: score recorded agent-to-agent runs on outcome, cost and turns
 - TypeScript SDK
 
