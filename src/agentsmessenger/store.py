@@ -117,6 +117,7 @@ class Store:
         self._db = _LockedConn(path, self._lock)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self.last_seq = self.max_seq()  # lets streams skip queries when nothing is new
 
     # ------------------------------------------------------------- agents
     def register_agent(self, card: AgentCard) -> tuple[AgentRecord, str]:
@@ -226,16 +227,28 @@ class Store:
         r = self._db.execute("SELECT seq, data FROM messages WHERE sender=? AND idem_key=?", (sender, key)).fetchone()
         return self._env(r) if r else None
 
-    def append(self, env_in: EnvelopeIn, *, thread_id: str, sender: str, sender_kind: str) -> Envelope:
+    def append(self, env_in: EnvelopeIn, *, thread_id: str, sender: str, sender_kind: str,
+               verified: bool = False, signer: Any = None, to_agent_id: str | None = None) -> Envelope:
         data: dict[str, Any] = env_in.model_dump(mode="json")
-        data.update(thread_id=thread_id, sender=sender, sender_kind=sender_kind, created_at=utcnow().isoformat())
+        data.update(thread_id=thread_id, sender=sender, sender_kind=sender_kind,
+                    created_at=utcnow().isoformat(), verified=verified)
         with self._lock, self._db:
             cur = self._db.execute(
                 "INSERT INTO messages(thread_id, sender, to_agent, to_capability, idem_key, data) VALUES (?,?,?,?,?,?)",
-                (thread_id, sender, env_in.to.agent, env_in.to.capability, env_in.idempotency_key, json.dumps(data)),
+                (thread_id, sender, to_agent_id or env_in.to.agent, env_in.to.capability, env_in.idempotency_key, json.dumps(data)),
             )
             seq = cur.lastrowid
-        return Envelope(**data, seq=seq)
+            env = Envelope(**data, seq=seq)
+            if signer is not None:
+                env.server_sig = signer.sign(env)
+                self._db.execute("UPDATE messages SET data=? WHERE seq=?",
+                                 (json.dumps(env.model_dump(mode="json", exclude={"seq"})), seq))
+            self.last_seq = max(self.last_seq, seq or 0)
+        return env
+
+    def max_seq(self) -> int:
+        r = self._db.execute("SELECT COALESCE(MAX(seq), 0) FROM messages").fetchone()
+        return int(r[0])
 
     @staticmethod
     def _env(r: sqlite3.Row | tuple) -> Envelope:

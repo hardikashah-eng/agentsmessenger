@@ -91,5 +91,5 @@ def build_server(client: Client) -> Any:
     return server
 
 
-def run(url: str, token: str) -> None:
-    build_server(Client(url, token)).run()
+def run(url: str, token: str, signing_key: str | None = None) -> None:
+    build_server(Client(url, token, signing_key=signing_key)).run()

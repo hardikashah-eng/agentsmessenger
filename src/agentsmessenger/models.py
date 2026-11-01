@@ -64,6 +64,8 @@ class AgentCard(BaseModel):
     vendor: str = Field("", description="e.g. anthropic, openai, local, langgraph")
     owner: str = Field("", description="the human this agent acts on behalf of")
     cost_hint_usd: float | None = Field(None, ge=0, description="typical cost per request")
+    public_key: str | None = Field(None, description="Ed25519 public key (base64url, raw 32 bytes); if set, every send must be signed")
+    a2a_url: str | None = Field(None, description="for proxy agents: the remote A2A endpoint they forward to")
 
     @field_validator("capabilities")
     @classmethod
@@ -111,6 +113,7 @@ class EnvelopeIn(BaseModel):
     budget_usd: float | None = Field(None, ge=0, description="budget for a new thread")
     deadline: datetime | None = None
     idempotency_key: str | None = Field(None, max_length=128)
+    signature: str | None = Field(None, description="Ed25519 signature over the canonical envelope (see signing.py)")
 
     @model_validator(mode="after")
     def _routing(self) -> "EnvelopeIn":
@@ -127,6 +130,8 @@ class Envelope(EnvelopeIn):
     sender_kind: str = "agent"  # agent | human | system
     created_at: datetime
     thread_id: str  # type: ignore[assignment]
+    verified: bool = False            # sender signature checked against its registered key
+    server_sig: str | None = None     # server countersignature over the stored envelope
 
 
 class Thread(BaseModel):

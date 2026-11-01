@@ -8,10 +8,10 @@ import hmac
 import os
 import secrets
 from importlib import resources
-from typing import Any
+from typing import Any, AsyncIterator, Callable
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .bus import Bus, Forbidden, NotFound
@@ -51,7 +51,7 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     if open_registration is None:
         open_registration = os.environ.get("AMSG_OPEN_REGISTRATION", "0") == "1"
 
-    app = FastAPI(title="Agents Messenger", version="0.1.0",
+    app = FastAPI(title="Agents Messenger", version="0.2.0",
                   description="An agent-native messenger: agents talk, humans observe.")
     app.state.bus = bus
     app.state.observer_token = observer_token
@@ -119,7 +119,16 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
 
     @app.put("/v1/me", response_model=AgentRecord)
     def update_me(card: AgentCard, agent: AgentRecord = Depends(agent_auth)) -> AgentRecord:
-        return bus.store.update_card(agent.id, card)
+        return bus.update_card(agent, card)
+
+    @app.get("/v1/keys")
+    def keys() -> dict[str, Any]:
+        """Public keys for verifying envelopes offline."""
+        return {
+            "server": {"alg": "Ed25519", "public_key": bus.signer.public_key},
+            "agents": {a.name: a.public_key for a in bus.find_agents() if a.public_key},
+            "require_signatures": bus.require_signatures,
+        }
 
     # -------------------------------------------------------------- messages
     @app.post("/v1/messages", response_model=Envelope, status_code=201)
@@ -136,6 +145,28 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             if items or asyncio.get_running_loop().time() >= deadline:
                 return items
             await asyncio.sleep(0.25)
+
+    @app.get("/v1/stream", include_in_schema=True)
+    async def stream(request: Request, after: int = 0, timeout: float = 0, max_events: int = 0,
+                     token: str | None = None, last_event_id: str | None = Header(None)) -> StreamingResponse:
+        """Server-Sent Events: each delivery for this agent as `event: delivery`.
+        Resume with Last-Event-ID or ?after=. `token` query param is for clients
+        (like EventSource) that can't set headers."""
+        tok = _bearer(request.headers.get("authorization")) or token
+        if not tok or is_observer(tok):
+            raise HTTPException(401, "agent token required")
+        try:
+            agent = bus.authenticate(tok)
+        except Forbidden:
+            raise HTTPException(401, "invalid agent token")
+        start = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
+
+        def fetch(cursor: int) -> list[tuple[int, str, str]]:
+            a = bus.store.get_agent(agent.id) or agent
+            return [(d.envelope.seq, "delivery", d.model_dump_json()) for d in bus.inbox(a, cursor)]
+
+        return StreamingResponse(_sse(request, bus, start, fetch, timeout, max_events), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     # --------------------------------------------------------------- threads
     @app.get("/v1/threads/{thread_id}", response_model=Thread)
@@ -171,6 +202,20 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     def obs_feed(after: int = 0, limit: int = Query(200, le=1000)) -> list[Envelope]:
         return list(bus.store.messages_since(after, limit))
 
+    @app.get("/v1/observe/stream")
+    async def obs_stream(request: Request, after: int = 0, timeout: float = 0, max_events: int = 0,
+                         token: str | None = None, last_event_id: str | None = Header(None)) -> StreamingResponse:
+        """SSE of every envelope on the bus (`event: envelope`)."""
+        if not is_observer(_bearer(request.headers.get("authorization")) or token):
+            raise HTTPException(401, "observer token required")
+        start = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
+
+        def fetch(cursor: int) -> list[tuple[int, str, str]]:
+            return [(e.seq, "envelope", e.model_dump_json()) for e in bus.store.messages_since(cursor)]
+
+        return StreamingResponse(_sse(request, bus, start, fetch, timeout, max_events), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
     @app.post("/v1/observe/threads/{thread_id}/messages", response_model=Envelope, status_code=201,
               dependencies=[Depends(observer_auth)])
     def obs_say(thread_id: str, body: HumanMessage) -> Envelope:
@@ -197,4 +242,39 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     def viewer() -> str:
         return resources.files("agentsmessenger").joinpath("viewer.html").read_text(encoding="utf-8")
 
+    from .a2a import mount_a2a
+    mount_a2a(app, bus)
     return app
+
+
+async def _sse(request: Request, bus: Bus, cursor: int, fetch: Callable[[int], list[tuple[int, str, str]]],
+               timeout: float, max_events: int, heartbeat: float = 15.0) -> AsyncIterator[bytes]:
+    """Generic SSE loop. Only queries the store when the bus has new messages."""
+    loop = asyncio.get_running_loop()
+    if cursor < 0:  # after=-1 means "only what arrives from now on"
+        cursor = bus.store.last_seq
+    started = last_beat = loop.time()
+    checked = -1
+    sent = 0
+    yield b"retry: 2000\n\n"
+    while True:
+        if await request.is_disconnected():
+            return
+        if bus.store.last_seq != checked:
+            checked = bus.store.last_seq
+            batch = fetch(cursor)
+            if batch:
+                checked = -1  # there may be more than one page; look again next tick
+            for seq, event, data in batch:
+                cursor = max(cursor, seq)
+                yield f"id: {seq}\nevent: {event}\ndata: {data}\n\n".encode()
+                sent += 1
+                if max_events and sent >= max_events:
+                    return
+        now = loop.time()
+        if timeout and now - started >= timeout:
+            return
+        if now - last_beat >= heartbeat:
+            last_beat = now
+            yield b": ping\n\n"
+        await asyncio.sleep(0.2)

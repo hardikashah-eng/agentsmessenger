@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, Callable, Iterator
 
 import httpx
+
+from .signing import sign
 
 
 class MessengerError(Exception):
@@ -17,8 +20,11 @@ class MessengerError(Exception):
 
 class Client:
     def __init__(self, base_url: str = "http://127.0.0.1:8765", token: str | None = None,
-                 http: httpx.Client | None = None) -> None:
+                 http: httpx.Client | None = None, signing_key: str | None = None) -> None:
+        """signing_key: this agent's Ed25519 private key (base64url). When set,
+        every envelope is signed; register with the matching public_key."""
         self.token = token
+        self.signing_key = signing_key
         self._http = http or httpx.Client(base_url=base_url, timeout=40)
 
     # ------------------------------------------------------------- plumbing
@@ -46,6 +52,9 @@ class Client:
     def me(self) -> dict[str, Any]:
         return self._req("GET", "/v1/me")
 
+    def update_card(self, name: str, capabilities: list[str] | None = None, **card: Any) -> dict[str, Any]:
+        return self._req("PUT", "/v1/me", json={"name": name, "capabilities": capabilities or [], **card})
+
     def find(self, capability: str | None = None) -> list[dict[str, Any]]:
         return self._req("GET", "/v1/agents", params={"capability": capability} if capability else None)
 
@@ -61,7 +70,10 @@ class Client:
             "in_reply_to": in_reply_to, "cost_usd": cost_usd, "budget_usd": budget_usd,
             "idempotency_key": idempotency_key, "artifacts": artifacts or [],
         }
-        return self._req("POST", "/v1/messages", json={k: v for k, v in body.items() if v is not None})
+        body = {k: v for k, v in body.items() if v is not None}
+        if self.signing_key:
+            body["signature"] = sign(body, self.signing_key)
+        return self._req("POST", "/v1/messages", json=body)
 
     def request(self, capability: str, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
         """Start a thread asking whoever offers `capability`."""
@@ -73,13 +85,38 @@ class Client:
     def inbox(self, after: int = 0, wait: float = 0, limit: int = 100) -> list[dict[str, Any]]:
         return self._req("GET", "/v1/inbox", params={"after": after, "wait": wait, "limit": limit})
 
+    def events(self, after: int = 0, timeout: float = 0, max_events: int = 0) -> Iterator[dict[str, Any]]:
+        """Server-Sent Events: yields deliveries as they arrive (no polling)."""
+        headers = {"Authorization": f"Bearer {self.token}", "Accept": "text/event-stream"}
+        params = {"after": after, "timeout": timeout, "max_events": max_events}
+        with self._http.stream("GET", "/v1/stream", headers=headers, params=params,
+                               timeout=httpx.Timeout(10, read=None)) as r:
+            if r.status_code >= 400:
+                r.read()
+                raise MessengerError(r.status_code, r.text)
+            event, data = None, []
+            for line in r.iter_lines():
+                if line == "":
+                    if event == "delivery" and data:
+                        yield json.loads("\n".join(data))
+                    event, data = None, []
+                elif line.startswith("event:"):
+                    event = line[6:].strip()
+                elif line.startswith("data:"):
+                    data.append(line[5:].lstrip())
+
     def listen(self, handler: Callable[[dict[str, Any]], None], after: int = 0, wait: float = 20,
-               stop: Callable[[], bool] = lambda: False) -> int:
-        """Long-poll the inbox and call handler(delivery) for each item. Returns the last cursor."""
+               stop: Callable[[], bool] = lambda: False, mode: str = "sse") -> int:
+        """Call handler(delivery) for each inbox item until stop() is true.
+        mode="sse" streams (reconnecting every `wait` seconds so stop() is checked);
+        mode="poll" long-polls. Returns the last cursor."""
         while not stop():
-            for d in self.inbox(after=after, wait=wait):
+            items = self.events(after=after, timeout=wait) if mode == "sse" else self.inbox(after=after, wait=wait)
+            for d in items:
                 after = max(after, d["envelope"]["seq"])
                 handler(d)
+                if stop():
+                    break
         return after
 
     def stream(self, after: int = 0, wait: float = 20) -> Iterator[dict[str, Any]]:

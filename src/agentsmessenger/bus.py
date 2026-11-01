@@ -12,6 +12,7 @@ from .models import (
     AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
     Thread, ThreadState, TRANSITIONS, TERMINAL,
 )
+from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
 
 HUMAN = "human"
@@ -27,15 +28,34 @@ class Forbidden(Exception):
 
 
 class Bus:
-    def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None) -> None:
+    def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None,
+                 signer: ServerSigner | None = None, require_signatures: bool = False) -> None:
         self.store = store or Store()
         self.guards = Guards(guard_config)
+        self.signer = signer or ServerSigner()
+        self.require_signatures = require_signatures
 
     # ------------------------------------------------------------ directory
     def register(self, card: AgentCard) -> tuple[AgentRecord, str]:
         if self.store.get_agent(card.name):
             raise GuardError("name_taken", f"an agent named {card.name!r} already exists")
+        self._check_card(card)
         return self.store.register_agent(card)
+
+    def update_card(self, agent: AgentRecord, card: AgentCard) -> AgentRecord:
+        if card.name != agent.name and self.store.get_agent(card.name):
+            raise GuardError("name_taken", f"an agent named {card.name!r} already exists")
+        if agent.public_key and card.public_key != agent.public_key:
+            # Rotating or removing a key must be done by the observer (re-register), not by a token holder.
+            raise Forbidden("public_key cannot be changed with an agent token")
+        self._check_card(card)
+        return self.store.update_card(agent.id, card)
+
+    def _check_card(self, card: AgentCard) -> None:
+        if card.public_key and not valid_public_key(card.public_key):
+            raise GuardError("bad_key", "public_key must be a base64url raw Ed25519 key", 422)
+        if self.require_signatures and not card.public_key:
+            raise GuardError("key_required", "this messenger requires every agent to register a public_key", 422)
 
     def authenticate(self, token: str) -> AgentRecord:
         a = self.store.agent_by_token(token)
@@ -54,10 +74,23 @@ class Bus:
         return a
 
     # ------------------------------------------------------------- sending
-    def send(self, sender: AgentRecord | None, env: EnvelopeIn) -> Envelope:
+    def send(self, sender: AgentRecord | None, env: EnvelopeIn, transport: str = "native") -> Envelope:
         """Send an envelope. sender=None means the human observer."""
         sender_id = sender.id if sender else HUMAN
         kind = "agent" if sender else "human"
+
+        verified = False
+        if sender is not None:
+            if sender.public_key:
+                if transport != "native":
+                    raise Forbidden("agents with a signing key must send through the native API")
+                if not env.signature:
+                    raise GuardError("signature_required", "this agent registered a public key; sign every envelope", 401)
+                if not verify(env, env.signature, sender.public_key):
+                    raise GuardError("bad_signature", "envelope signature does not verify", 401)
+                verified = True
+            elif self.require_signatures:
+                raise GuardError("signature_required", "this messenger requires signed envelopes", 401)
 
         if env.idempotency_key:
             prior = self.store.find_idempotent(sender_id, env.idempotency_key)
@@ -66,8 +99,8 @@ class Bus:
 
         to_agent: AgentRecord | None = None
         if env.to.agent:
+            # Keep the envelope exactly as signed; the resolved id is stored alongside for routing.
             to_agent = self.resolve_agent(env.to.agent)
-            env = env.model_copy(update={"to": env.to.model_copy(update={"agent": to_agent.id})})
         if env.to.capability and not self.store.list_agents(env.to.capability):
             raise NotFound(f"no agent offers capability {env.to.capability!r}")
 
@@ -90,7 +123,9 @@ class Bus:
                 budget_usd=budget, deadline=env.deadline,
             )
 
-        stored = self.store.append(env, thread_id=thread.id, sender=sender_id, sender_kind=kind)
+        stored = self.store.append(env, thread_id=thread.id, sender=sender_id, sender_kind=kind,
+                                   verified=verified, signer=self.signer,
+                                   to_agent_id=to_agent.id if to_agent else None)
 
         thread = self._thread(thread.id)
         thread.message_count += 1
@@ -181,7 +216,7 @@ class Bus:
 
     def _system(self, thread_id: str, payload: dict[str, Any], text: str) -> Envelope:
         env = EnvelopeIn(thread_id=thread_id, intent=Intent.inform, payload=payload, text=text)
-        return self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system")
+        return self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system", signer=self.signer)
 
     # ------------------------------------------------------------- reading
     def deliver(self, reader_id: str, env: Envelope) -> Delivery:

@@ -119,6 +119,7 @@ async function renderThread(id) {
         el("strong", {}, names[e.sender] || e.sender), e.to.capability ? el("span", { class: "muted" }, "→ " + e.to.capability) : null,
         e.to.agent ? el("span", { class: "muted" }, "→ " + (names[e.to.agent] || e.to.agent)) : null,
         e.cost_usd ? el("span", { class: "mono muted" }, "$" + e.cost_usd.toFixed(3)) : null,
+        e.verified ? el("span", { class: "badge", title: "Signature verified against the sender's registered key" }, "signed ✓") : null,
         el("button", { onclick: () => det.toggleAttribute("hidden") }, "Envelope")),
       el("div", { style: "margin-top:4px;white-space:pre-wrap" }, e.text || el("span", { class: "muted" }, "(no prose; see envelope)")),
       d.notice && d.notice.includes("Flagged") ? el("div", { class: "flag" }, d.notice.split("Flagged phrases:")[1] ? "Possible injection: " + d.notice.split("Flagged phrases:")[1] : "") : null,
@@ -131,7 +132,18 @@ async function renderThread(id) {
 $("auth").addEventListener("submit", (ev) => {
   ev.preventDefault(); token = $("tok").value.trim();
   try { localStorage.setItem("amsg_obs", token); } catch (e) {}
-  clearInterval(timer); refresh(); timer = setInterval(() => { if (!document.activeElement || document.activeElement.id !== "say") refresh(); }, 2500);
+  clearInterval(timer); refresh();
+  // Live updates over Server-Sent Events; a slow poll stays on as a safety net.
+  if (window._es) window._es.close();
+  let pending = null;
+  const kick = () => { if (pending) return; pending = setTimeout(() => { pending = null; if (!document.activeElement || document.activeElement.id !== "say") refresh(); }, 150); };
+  try {
+    window._es = new EventSource("/v1/observe/stream?token=" + encodeURIComponent(token) + "&after=-1");
+    window._es.addEventListener("envelope", kick);
+    window._es.onopen = () => { $("status").textContent = "live (streaming)"; };
+    window._es.onerror = () => { $("status").textContent = "reconnecting…"; };
+  } catch (e) {}
+  timer = setInterval(kick, 15000);
 });
 if (token) $("auth").requestSubmit();
 </script>
