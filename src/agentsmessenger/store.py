@@ -1,0 +1,288 @@
+"""SQLite persistence. One file, no external services."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import secrets
+import sqlite3
+import threading
+import uuid
+from datetime import datetime
+from typing import Any, Iterable
+
+from .models import AgentCard, AgentRecord, Envelope, EnvelopeIn, Thread, ThreadState, utcnow
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS agents (
+  id TEXT PRIMARY KEY,
+  name TEXT UNIQUE NOT NULL,
+  card TEXT NOT NULL,
+  token_hash TEXT NOT NULL,
+  paused INTEGER NOT NULL DEFAULT 0,
+  registered_at TEXT NOT NULL,
+  last_seen TEXT
+);
+CREATE TABLE IF NOT EXISTS capabilities (
+  agent_id TEXT NOT NULL,
+  capability TEXT NOT NULL,
+  PRIMARY KEY (agent_id, capability)
+);
+CREATE TABLE IF NOT EXISTS threads (
+  id TEXT PRIMARY KEY,
+  data TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS participants (
+  thread_id TEXT NOT NULL,
+  agent_id TEXT NOT NULL,
+  PRIMARY KEY (thread_id, agent_id)
+);
+CREATE TABLE IF NOT EXISTS messages (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  sender TEXT NOT NULL,
+  to_agent TEXT,
+  to_capability TEXT,
+  idem_key TEXT,
+  data TEXT NOT NULL,
+  UNIQUE (sender, idem_key)
+);
+CREATE INDEX IF NOT EXISTS ix_messages_thread ON messages(thread_id, seq);
+CREATE INDEX IF NOT EXISTS ix_messages_agent ON messages(to_agent, seq);
+CREATE INDEX IF NOT EXISTS ix_messages_cap ON messages(to_capability, seq);
+"""
+
+
+def _hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _dt(v: str | None) -> datetime | None:
+    return datetime.fromisoformat(v) if v else None
+
+
+class _Result:
+    def __init__(self, rows: list[Any], lastrowid: int | None) -> None:
+        self._rows, self.lastrowid = rows, lastrowid
+
+    def fetchone(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self) -> list[Any]:
+        return self._rows
+
+    def __iter__(self):
+        return iter(self._rows)
+
+
+class _LockedConn:
+    """One SQLite connection shared across server threads, serialized by a lock."""
+
+    def __init__(self, path: str, lock: threading.RLock) -> None:
+        self._c = sqlite3.connect(path, check_same_thread=False)
+        self._c.row_factory = sqlite3.Row
+        self._lock = lock
+
+    def execute(self, sql: str, params: Any = ()) -> _Result:
+        with self._lock:
+            cur = self._c.execute(sql, params)
+            return _Result(cur.fetchall(), cur.lastrowid)
+
+    def executemany(self, sql: str, seq: Any) -> None:
+        with self._lock:
+            self._c.executemany(sql, seq)
+
+    def executescript(self, sql: str) -> None:
+        with self._lock:
+            self._c.executescript(sql)
+
+    def __enter__(self) -> "_LockedConn":
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, *_: Any) -> None:
+        try:
+            if exc_type is None:
+                self._c.commit()
+            else:
+                self._c.rollback()
+        finally:
+            self._lock.release()
+
+
+class Store:
+    def __init__(self, path: str = ":memory:") -> None:
+        self._lock = threading.RLock()
+        self._db = _LockedConn(path, self._lock)
+        self._db.execute("PRAGMA journal_mode=WAL")
+        self._db.executescript(SCHEMA)
+
+    # ------------------------------------------------------------- agents
+    def register_agent(self, card: AgentCard) -> tuple[AgentRecord, str]:
+        token = "am_" + secrets.token_urlsafe(32)
+        agent_id = "agt_" + uuid.uuid4().hex[:12]
+        now = utcnow()
+        with self._lock, self._db:
+            self._db.execute(
+                "INSERT INTO agents(id, name, card, token_hash, registered_at) VALUES (?,?,?,?,?)",
+                (agent_id, card.name, card.model_dump_json(), _hash(token), now.isoformat()),
+            )
+            self._db.executemany(
+                "INSERT INTO capabilities(agent_id, capability) VALUES (?,?)",
+                [(agent_id, c) for c in card.capabilities],
+            )
+        return self.get_agent(agent_id), token  # type: ignore[return-value]
+
+    def update_card(self, agent_id: str, card: AgentCard) -> AgentRecord:
+        with self._lock, self._db:
+            self._db.execute("UPDATE agents SET card=?, name=? WHERE id=?", (card.model_dump_json(), card.name, agent_id))
+            self._db.execute("DELETE FROM capabilities WHERE agent_id=?", (agent_id,))
+            self._db.executemany(
+                "INSERT INTO capabilities(agent_id, capability) VALUES (?,?)",
+                [(agent_id, c) for c in card.capabilities],
+            )
+        return self.get_agent(agent_id)  # type: ignore[return-value]
+
+    def _agent_from_row(self, r: sqlite3.Row) -> AgentRecord:
+        card = json.loads(r["card"])
+        return AgentRecord(
+            **card,
+            id=r["id"],
+            paused=bool(r["paused"]),
+            registered_at=_dt(r["registered_at"]),  # type: ignore[arg-type]
+            last_seen=_dt(r["last_seen"]),
+        )
+
+    def get_agent(self, agent_id: str) -> AgentRecord | None:
+        r = self._db.execute("SELECT * FROM agents WHERE id=? OR name=?", (agent_id, agent_id)).fetchone()
+        return self._agent_from_row(r) if r else None
+
+    def agent_by_token(self, token: str) -> AgentRecord | None:
+        r = self._db.execute("SELECT * FROM agents WHERE token_hash=?", (_hash(token),)).fetchone()
+        return self._agent_from_row(r) if r else None
+
+    def touch(self, agent_id: str) -> None:
+        with self._lock, self._db:
+            self._db.execute("UPDATE agents SET last_seen=? WHERE id=?", (utcnow().isoformat(), agent_id))
+
+    def set_agent_paused(self, agent_id: str, paused: bool) -> None:
+        with self._lock, self._db:
+            self._db.execute("UPDATE agents SET paused=? WHERE id=?", (int(paused), agent_id))
+
+    def list_agents(self, capability: str | None = None) -> list[AgentRecord]:
+        if capability:
+            rows = self._db.execute(
+                "SELECT a.* FROM agents a JOIN capabilities c ON c.agent_id=a.id WHERE c.capability=? ORDER BY a.name",
+                (capability,),
+            ).fetchall()
+        else:
+            rows = self._db.execute("SELECT * FROM agents ORDER BY name").fetchall()
+        return [self._agent_from_row(r) for r in rows]
+
+    def capabilities_of(self, agent_id: str) -> list[str]:
+        return [r[0] for r in self._db.execute("SELECT capability FROM capabilities WHERE agent_id=?", (agent_id,))]
+
+    # ------------------------------------------------------------ threads
+    def create_thread(self, *, subject: str, creator: str, capability: str | None,
+                      budget_usd: float | None, deadline: datetime | None) -> Thread:
+        now = utcnow()
+        t = Thread(
+            id="thr_" + uuid.uuid4().hex[:12], subject=subject, state=ThreadState.open,
+            creator=creator, capability=capability, participants=[creator],
+            budget_usd=budget_usd, created_at=now, updated_at=now, deadline=deadline,
+        )
+        with self._lock, self._db:
+            self._db.execute("INSERT INTO threads(id, data, updated_at) VALUES (?,?,?)",
+                             (t.id, t.model_dump_json(), now.isoformat()))
+            self._db.execute("INSERT OR IGNORE INTO participants VALUES (?,?)", (t.id, creator))
+        return t
+
+    def get_thread(self, thread_id: str) -> Thread | None:
+        r = self._db.execute("SELECT data FROM threads WHERE id=?", (thread_id,)).fetchone()
+        return Thread.model_validate_json(r[0]) if r else None
+
+    def save_thread(self, t: Thread) -> Thread:
+        t.updated_at = utcnow()
+        with self._lock, self._db:
+            self._db.execute("UPDATE threads SET data=?, updated_at=? WHERE id=?",
+                             (t.model_dump_json(), t.updated_at.isoformat(), t.id))
+        return t
+
+    def add_participant(self, t: Thread, agent_id: str) -> Thread:
+        if agent_id not in t.participants:
+            t.participants.append(agent_id)
+            with self._lock, self._db:
+                self._db.execute("INSERT OR IGNORE INTO participants VALUES (?,?)", (t.id, agent_id))
+            self.save_thread(t)
+        return t
+
+    def list_threads(self, limit: int = 100) -> list[Thread]:
+        rows = self._db.execute("SELECT data FROM threads ORDER BY updated_at DESC LIMIT ?", (limit,)).fetchall()
+        return [Thread.model_validate_json(r[0]) for r in rows]
+
+    # ----------------------------------------------------------- messages
+    def find_idempotent(self, sender: str, key: str) -> Envelope | None:
+        r = self._db.execute("SELECT seq, data FROM messages WHERE sender=? AND idem_key=?", (sender, key)).fetchone()
+        return self._env(r) if r else None
+
+    def append(self, env_in: EnvelopeIn, *, thread_id: str, sender: str, sender_kind: str) -> Envelope:
+        data: dict[str, Any] = env_in.model_dump(mode="json")
+        data.update(thread_id=thread_id, sender=sender, sender_kind=sender_kind, created_at=utcnow().isoformat())
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "INSERT INTO messages(thread_id, sender, to_agent, to_capability, idem_key, data) VALUES (?,?,?,?,?,?)",
+                (thread_id, sender, env_in.to.agent, env_in.to.capability, env_in.idempotency_key, json.dumps(data)),
+            )
+            seq = cur.lastrowid
+        return Envelope(**data, seq=seq)
+
+    @staticmethod
+    def _env(r: sqlite3.Row | tuple) -> Envelope:
+        seq, data = r[0], r[1]
+        return Envelope(**json.loads(data), seq=seq)
+
+    def thread_messages(self, thread_id: str, after: int = 0, limit: int = 500) -> list[Envelope]:
+        rows = self._db.execute(
+            "SELECT seq, data FROM messages WHERE thread_id=? AND seq>? ORDER BY seq LIMIT ?",
+            (thread_id, after, limit),
+        ).fetchall()
+        return [self._env(r) for r in rows]
+
+    def last_messages(self, thread_id: str, n: int) -> list[Envelope]:
+        rows = self._db.execute(
+            "SELECT seq, data FROM messages WHERE thread_id=? ORDER BY seq DESC LIMIT ?", (thread_id, n)
+        ).fetchall()
+        return [self._env(r) for r in reversed(rows)]
+
+    def inbox(self, agent_id: str, after: int, limit: int = 100) -> list[Envelope]:
+        """Messages for this agent: addressed to it, to one of its capabilities
+        (while the thread is unclaimed or claimed by it), or posted into a
+        thread it participates in. Its own messages are excluded."""
+        caps = self.capabilities_of(agent_id)
+        cap_clause = f" OR m.to_capability IN ({','.join('?' * len(caps))})" if caps else ""
+        rows = self._db.execute(
+            f"""
+            SELECT m.seq, m.data FROM messages m
+            WHERE m.sender != ?
+              AND (m.to_agent = ?{cap_clause}
+                   OR m.thread_id IN (SELECT thread_id FROM participants WHERE agent_id = ?))
+              AND m.seq > ?
+            ORDER BY m.seq LIMIT ?
+            """,
+            [agent_id, agent_id, *caps, agent_id, after, limit],
+        ).fetchall()
+        out = []
+        for r in rows:
+            env = self._env(r)
+            # Capability broadcasts stop going to others once someone else owns the thread.
+            if env.to.capability and env.to.agent is None:
+                t = self.get_thread(env.thread_id)
+                if t and t.owner and t.owner != agent_id and agent_id not in t.participants:
+                    continue
+            out.append(env)
+        return out
+
+    def messages_since(self, after: int, limit: int = 200) -> Iterable[Envelope]:
+        rows = self._db.execute("SELECT seq, data FROM messages WHERE seq>? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
+        return [self._env(r) for r in rows]
