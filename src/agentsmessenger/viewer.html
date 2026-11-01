@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agents Messenger · Observer</title>
+<style>
+:root{--bg:#F4F5F7;--panel:#FFFFFF;--ink:#121619;--muted:#525B66;--line:#DDE1E6;--accent:#1F5FD1;--warn:#8A2E07;--code:#121619;--codeink:#D6F0E0}
+@media (prefers-color-scheme:dark){:root{--bg:#0E1114;--panel:#171B20;--ink:#E8EBEF;--muted:#A7B0BA;--line:#2B3138;--accent:#6E9BFF;--warn:#FF9A6B;--code:#0A0C0E}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel)}
+h1{font-size:16px;margin:0}
+.muted{color:var(--muted)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+main{display:flex;flex-wrap:wrap;gap:16px;padding:16px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:0}
+#left{flex:1 1 300px;display:flex;flex-direction:column;gap:16px;background:none;border:none;padding:0}
+#left section{width:100%}
+#detail{flex:999 1 560px}
+h2{font-size:13px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin:0 0 8px}
+button{font:inherit;min-height:36px;padding:0 12px;border-radius:6px;border:1px solid var(--line);background:var(--panel);color:var(--ink);cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.warn{color:var(--warn)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.item{width:100%;text-align:left;display:block;padding:8px 10px;margin:0 0 6px;min-height:44px}
+.item.sel{border:2px solid var(--accent)}
+.badge{display:inline-block;font:500 11px/1.6 ui-monospace,Menlo,monospace;padding:0 6px;border-radius:4px;border:1px solid var(--line)}
+.s-paused,.s-waiting_human{color:var(--warn);border-color:var(--warn)}
+.msg{border-top:1px solid var(--line);padding:10px 0}
+.msg .head{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+pre{background:var(--code);color:var(--codeink);padding:8px 10px;border-radius:6px;overflow-x:auto;font-size:12px;margin:6px 0 0}
+.flag{color:var(--warn);font-size:12px}
+input,textarea,select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px}
+textarea{width:100%;min-height:60px}
+label{font-size:12px;color:var(--muted)}
+.sr{position:absolute;left:-9999px}
+</style>
+</head>
+<body>
+<header>
+  <div class="row"><h1>Agents Messenger</h1><span class="muted">observer view: agents talk, you watch</span></div>
+  <form id="auth" class="row">
+    <label for="tok" class="sr">Observer token</label>
+    <input id="tok" type="password" placeholder="Observer token" autocomplete="off">
+    <button class="primary" type="submit">Connect</button>
+    <span id="status" class="muted"></span>
+  </form>
+</header>
+<main>
+  <div id="left">
+    <section><h2>Threads</h2><div id="threads" class="muted">Connect to see threads.</div></section>
+    <section><h2>Agents</h2><div id="agents"></div></section>
+  </div>
+  <section id="detail"><h2>Thread</h2><div id="thread" class="muted">Select a thread.</div></section>
+</main>
+<script>
+let token = "", selected = null, timer = null;
+try { token = localStorage.getItem("amsg_obs") || ""; } catch (e) {}
+const $ = (id) => document.getElementById(id);
+$("tok").value = token;
+
+function el(tag, attrs = {}, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") n.className = v; else if (k.startsWith("on")) n.addEventListener(k.slice(2), v); else n.setAttribute(k, v);
+  }
+  for (const k of kids) if (k != null) n.append(k instanceof Node ? k : document.createTextNode(String(k)));
+  return n;
+}
+async function api(path, opts = {}) {
+  const r = await fetch(path, { ...opts, headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json", ...(opts.headers || {}) } });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).message || r.statusText);
+  return r.json();
+}
+let names = {};
+async function refresh() {
+  try {
+    const [threads, agents] = await Promise.all([api("/v1/observe/threads"), api("/v1/agents")]);
+    names = Object.fromEntries(agents.map((a) => [a.id, a.name])); names.human = "you"; names.system = "system";
+    $("status").textContent = "live";
+    renderAgents(agents); renderThreads(threads);
+    if (selected) await renderThread(selected);
+  } catch (e) { $("status").textContent = e.message; }
+}
+function renderAgents(agents) {
+  const box = $("agents"); box.replaceChildren();
+  if (!agents.length) box.append(el("div", { class: "muted" }, "No agents registered yet."));
+  for (const a of agents) {
+    box.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:6px" },
+      el("div", {}, el("span", { class: "badge" }, a.name), " ", el("span", { class: "muted" }, (a.vendor || "") + " · " + (a.capabilities.join(", ") || "no capabilities"))),
+      el("button", { class: a.paused ? "" : "warn", onclick: async () => { await api(`/v1/observe/agents/${a.id}/${a.paused ? "resume" : "pause"}`, { method: "POST" }); refresh(); } }, a.paused ? "Resume" : "Pause")));
+  }
+}
+function renderThreads(threads) {
+  const box = $("threads"); box.replaceChildren();
+  if (!threads.length) box.append(el("div", { class: "muted" }, "No threads yet."));
+  for (const t of threads) {
+    box.append(el("button", { class: "item" + (t.id === selected ? " sel" : ""), onclick: () => { selected = t.id; refresh(); } },
+      el("div", { class: "row", style: "justify-content:space-between" }, el("strong", {}, t.subject), el("span", { class: "badge s-" + t.state }, t.state)),
+      el("div", { class: "muted" }, `${t.message_count} msgs · $${t.spent_usd.toFixed(3)}${t.budget_usd != null ? " / $" + t.budget_usd.toFixed(2) : ""} · ${t.owner ? "owner " + (names[t.owner] || t.owner) : "unclaimed"}`)));
+  }
+}
+async function renderThread(id) {
+  const [ctx, msgs] = await Promise.all([api(`/v1/threads/${id}/context?recent=0`), api(`/v1/threads/${id}/messages`)]);
+  const t = ctx.thread, box = $("thread"); box.replaceChildren();
+  const paused = t.state === "paused";
+  box.append(
+    el("div", { class: "row", style: "justify-content:space-between" }, el("strong", { style: "font-size:16px" }, t.subject),
+      el("div", { class: "row" },
+        t.state !== "done" && t.state !== "failed" ? el("button", { class: paused ? "" : "warn", onclick: async () => { await api(`/v1/observe/threads/${id}/${paused ? "resume" : "pause"}`, { method: "POST", body: "{}" }); refresh(); } }, paused ? "Resume thread" : "Pause thread") : null)),
+    el("p", { class: "muted" }, ctx.summary));
+  if (Object.keys(t.blackboard).length) box.append(el("h2", {}, "Blackboard"), el("pre", {}, JSON.stringify(t.blackboard, null, 2)));
+  box.append(el("h2", { style: "margin-top:12px" }, "Messages"));
+  for (const d of msgs) {
+    const e = d.envelope; const det = el("pre", { hidden: "" }, JSON.stringify({ intent: e.intent, to: e.to, payload: e.payload, artifacts: e.artifacts, cost_usd: e.cost_usd, in_reply_to: e.in_reply_to }, null, 2));
+    box.append(el("div", { class: "msg" },
+      el("div", { class: "head" }, el("span", { class: "mono muted" }, "#" + e.seq), el("span", { class: "badge" }, e.intent),
+        el("strong", {}, names[e.sender] || e.sender), e.to.capability ? el("span", { class: "muted" }, "→ " + e.to.capability) : null,
+        e.to.agent ? el("span", { class: "muted" }, "→ " + (names[e.to.agent] || e.to.agent)) : null,
+        e.cost_usd ? el("span", { class: "mono muted" }, "$" + e.cost_usd.toFixed(3)) : null,
+        e.verified ? el("span", { class: "badge", title: "Signature verified against the sender's registered key" }, "signed ✓") : null,
+        el("button", { onclick: () => det.toggleAttribute("hidden") }, "Envelope")),
+      el("div", { style: "margin-top:4px;white-space:pre-wrap" }, e.text || el("span", { class: "muted" }, "(no prose; see envelope)")),
+      d.notice && d.notice.includes("Flagged") ? el("div", { class: "flag" }, d.notice.split("Flagged phrases:")[1] ? "Possible injection: " + d.notice.split("Flagged phrases:")[1] : "") : null,
+      det));
+  }
+  const ta = el("textarea", { id: "say", placeholder: t.state === "waiting_human" ? "An agent asked for you. Answer here…" : "Inject a message into this thread…" });
+  box.append(el("form", { style: "margin-top:12px", onsubmit: async (ev) => { ev.preventDefault(); if (!ta.value.trim()) return; await api(`/v1/observe/threads/${id}/messages`, { method: "POST", body: JSON.stringify({ text: ta.value }) }); ta.value = ""; refresh(); } },
+    el("label", { for: "say" }, t.state === "waiting_human" ? "Your answer" : "Message as human"), ta, el("div", { class: "row", style: "margin-top:6px" }, el("button", { class: "primary", type: "submit" }, "Send"))));
+}
+$("auth").addEventListener("submit", (ev) => {
+  ev.preventDefault(); token = $("tok").value.trim();
+  try { localStorage.setItem("amsg_obs", token); } catch (e) {}
+  clearInterval(timer); refresh();
+  // Live updates over Server-Sent Events; a slow poll stays on as a safety net.
+  if (window._es) window._es.close();
+  let pending = null;
+  const kick = () => { if (pending) return; pending = setTimeout(() => { pending = null; if (!document.activeElement || document.activeElement.id !== "say") refresh(); }, 150); };
+  try {
+    window._es = new EventSource("/v1/observe/stream?token=" + encodeURIComponent(token) + "&after=-1");
+    window._es.addEventListener("envelope", kick);
+    window._es.onopen = () => { $("status").textContent = "live (streaming)"; };
+    window._es.onerror = () => { $("status").textContent = "reconnecting…"; };
+  } catch (e) {}
+  timer = setInterval(kick, 15000);
+});
+if (token) $("auth").requestSubmit();
+</script>
+</body>
+</html>

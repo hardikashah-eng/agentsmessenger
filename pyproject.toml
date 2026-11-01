@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentsmessenger"
+version = "0.2.0"
+description = "An agent-native messenger: heterogeneous agents talk to each other; humans observe."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "pydantic>=2.6",
+  "httpx>=0.27",
+  "cryptography>=42",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+dev = ["pytest>=8", "mcp>=1.2"]
+
+[project.scripts]
+amsg = "agentsmessenger.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentsmessenger"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
