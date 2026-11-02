@@ -11,7 +11,7 @@ import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-NAMES = ["summarizer", "researcher", "coder", "payments"]
+NAMES = ["summarizer", "researcher", "coder", "payments", "reviewer"]
 
 if __name__ == "__main__":
     agents = [importlib.import_module(n).agent for n in NAMES]

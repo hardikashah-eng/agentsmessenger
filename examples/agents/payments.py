@@ -30,7 +30,7 @@ def pay(payload, task):
     LEDGER.parent.mkdir(parents=True, exist_ok=True)
     entry = {"ts": time.time(), "payee": payee, "amount": amount, "currency": currency,
              "memo": payload.get("memo"), "thread": task.thread_id, "simulated": True}
-    with LEDGER.open("a") as f:
+    with LEDGER.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
     return Result({"status": "recorded", "simulated": True, **entry}, text=f"Recorded {amount:.2f} {currency} to {payee} (simulated)")
 

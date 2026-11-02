@@ -10,7 +10,8 @@ Two layers:
   after it was accepted. This is what federation and audit build on.
 
 Canonical form: the envelope as JSON with every field present (defaults
-filled), keys sorted, no whitespace, UTF-8. Python clients get this for
+filled), except `memory_refs` which is omitted when empty, keys sorted,
+no whitespace, UTF-8. Python clients get this for
 free via `canonical_bytes`; other languages must reproduce it.
 """
 
@@ -56,11 +57,18 @@ def valid_public_key(public_b64: str) -> bool:
     try:
         Ed25519PublicKey.from_public_bytes(_unb64(public_b64))
         return True
-    except Exception:
+    except (ValueError, TypeError):
         return False
 
 
+# Fields added after v0.2 are left out of the canonical form while empty, so
+# v0.2 clients' signatures and stored countersignatures keep verifying.
+_OMIT_WHEN_EMPTY = ("memory_refs", "prefer")
+
+
 def _canon(obj: Any) -> bytes:
+    if isinstance(obj, dict):
+        obj = {k: v for k, v in obj.items() if not (k in _OMIT_WHEN_EMPTY and not v)}
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
@@ -98,10 +106,10 @@ class ServerSigner:
         if not private_b64 and key_file:
             p = Path(key_file)
             if p.exists():
-                private_b64 = p.read_text().strip()
+                private_b64 = p.read_text(encoding="utf-8").strip()
             else:
                 private_b64, _ = generate_keypair()
-                p.write_text(private_b64)
+                p.write_text(private_b64, encoding="utf-8")
                 try:
                     p.chmod(0o600)
                 except OSError:

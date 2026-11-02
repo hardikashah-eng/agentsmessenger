@@ -7,30 +7,25 @@ from __future__ import annotations
 
 from typing import Any
 
-from .guards import GuardConfig, GuardError, Guards, UNTRUSTED_NOTICE, injection_flags
+from .guards import GuardConfig, GuardError, Guards, Forbidden, NotFound, UNTRUSTED_NOTICE, injection_flags
+from .memory import MemoryMixin
 from .models import (
-    AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
-    Thread, ThreadState, TRANSITIONS, TERMINAL,
+    Address, AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
+    Thread, ThreadState, TRANSITIONS, TERMINAL, estimate_tokens,
 )
+from .router import HUMAN, SYSTEM, RouterConfig, RouterMixin
 from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
 
-HUMAN = "human"
-SYSTEM = "system"
+__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM", "RouterConfig"]
 
 
-class NotFound(Exception):
-    pass
-
-
-class Forbidden(Exception):
-    pass
-
-
-class Bus:
+class Bus(MemoryMixin, RouterMixin):
     def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None,
-                 signer: ServerSigner | None = None, require_signatures: bool = False) -> None:
+                 signer: ServerSigner | None = None, require_signatures: bool = False,
+                 router: RouterConfig | None = None) -> None:
         self.store = store or Store()
+        self.router = router or RouterConfig()
         self.guards = Guards(guard_config)
         self.signer = signer or ServerSigner()
         self.require_signatures = require_signatures
@@ -110,10 +105,17 @@ class Bus:
             if sender and sender.id not in thread.participants and not self._can_join(sender, thread):
                 raise Forbidden("not a participant of this thread")
 
+        if env.memory_refs:
+            self.check_memory_refs(sender.id if sender else None, env.memory_refs)
+
         if sender is not None:
             self.guards.check_send(sender_id, sender.paused, env, thread)
         elif thread is not None and thread.state in TERMINAL:
             raise GuardError("thread_closed", f"thread is {thread.state.value}")
+
+        plan = None
+        if thread is None and env.intent == Intent.request and not env.to.agent:
+            plan = self.plan_route(sender_id, env)
 
         if thread is None:
             subject = env.subject or (env.text or env.intent.value)[:120]
@@ -125,7 +127,7 @@ class Bus:
 
         stored = self.store.append(env, thread_id=thread.id, sender=sender_id, sender_kind=kind,
                                    verified=verified, signer=self.signer,
-                                   to_agent_id=to_agent.id if to_agent else None)
+                                   to_agent_id=to_agent.id if to_agent else plan["candidates"][0]["agent"] if plan else None)
 
         thread = self._thread(thread.id)
         thread.message_count += 1
@@ -135,6 +137,12 @@ class Bus:
             self.store.add_participant(thread, sender.id)
         if to_agent:
             self.store.add_participant(thread, to_agent.id)
+        if stored.memory_refs:
+            self.grant_refs_to_thread(sender.id if sender else None, stored)
+        if plan:
+            self.apply_route(self._thread(thread.id), stored, plan)
+        if sender and env.cost_usd:
+            self.store.bump_stats(sender.id, cost_usd=env.cost_usd)
         thread = self._thread(thread.id)
 
         if env.intent == Intent.ask_human:
@@ -142,14 +150,32 @@ class Bus:
         elif sender is None and thread.state == ThreadState.waiting_human:
             thread.state = ThreadState.working if thread.owner else ThreadState.open
         self.store.save_thread(thread)
+        self._after_send(sender, self._thread(thread.id), stored)
 
+        thread = self._thread(thread.id)
         reason = self.guards.detect_loop(self.store.last_messages(thread.id, self.guards.config.loop_window))
         if reason and thread.state not in TERMINAL:
             self._pause_thread(thread, reason)
         return stored
 
+    def _after_send(self, sender: AgentRecord | None, t: Thread, stored: Envelope) -> None:
+        """Verification hooks: verdicts from the reviewer, new results from the worker, human answers."""
+        v = t.verification
+        if sender is not None:
+            if v.get("status") == "pending" and v.get("verifier") == sender.id:
+                self.on_verifier_message(t, sender, stored)
+            elif stored.intent == Intent.result:
+                self.maybe_verify(sender, t, stored)
+        elif t.state == ThreadState.verifying and v.get("verifier") == HUMAN and v.get("status") == "pending":
+            verdict = self.parse_verdict(stored)
+            if verdict:
+                notes = (stored.text or "").split(":", 1)[1].strip() if ":" in (stored.text or "") else ""
+                self.apply_verdict(t, HUMAN, verdict, notes)
+
     def _can_join(self, agent: AgentRecord, t: Thread) -> bool:
-        # Agents offering the routed capability may join an unclaimed thread.
+        # Agents offering the routed capability may join an unclaimed thread, unless the router assigned it.
+        if t.assigned_to and t.assigned_to != agent.id:
+            return False
         return bool(t.capability and t.capability in agent.capabilities and t.owner is None)
 
     # -------------------------------------------------------------- threads
@@ -170,6 +196,9 @@ class Bus:
             return t
         if t.state != ThreadState.open or t.owner:
             raise GuardError("already_claimed", f"thread is {t.state.value}" + (f", owned by {t.owner}" if t.owner else ""))
+        if t.assigned_to and t.assigned_to != agent.id:
+            owner = self.store.get_agent(t.assigned_to)
+            raise Forbidden(f"the router assigned this thread to {owner.name if owner else t.assigned_to}")
         if t.capability and t.capability not in agent.capabilities and agent.id not in t.participants:
             raise Forbidden(f"agent does not offer {t.capability!r}")
         t.owner = agent.id
@@ -185,6 +214,26 @@ class Bus:
             raise Forbidden("only the thread's owner or creator can change its state")
         if agent is not None and state == ThreadState.paused:
             raise Forbidden("only the human observer can pause a thread")
+        if state == t.state:
+            return t
+        if state == ThreadState.verifying and agent is not None:
+            raise Forbidden("verification starts when you post a result")
+        if state == ThreadState.done:
+            if agent is not None and self.router.verify and \
+                    t.verification.get("status") not in ("approved", "overridden", "skipped"):
+                return self._done_needs_review(agent, t)
+            if agent is None and t.verification.get("status") == "pending":
+                t.verification["status"] = "overridden"
+            if agent is not None and agent.id == t.owner and not self.router.verify:
+                self.store.bump_stats(agent.id, approved=1)
+        if state == ThreadState.failed and agent is not None and agent.id == t.owner and t.routing.get("request_seq"):
+            self.store.bump_stats(agent.id, failed=1)
+            if self.router.enabled and t.state not in TERMINAL:
+                # Next capable agent; with none left the thread fails as usual.
+                moved = self.reroute(t, f"{agent.name} failed" + (f": {reason}" if reason else ""), on_failure=True)
+                if moved is not None:
+                    return moved
+                t = self._thread(thread_id)
         if state not in TRANSITIONS[t.state] and not (agent is None and t.state not in TERMINAL):
             raise GuardError("bad_transition", f"cannot go from {t.state.value} to {state.value}")
         t.state = state
@@ -195,6 +244,16 @@ class Bus:
         who = agent.name if agent else HUMAN
         self._system(t.id, {"event": "state", "state": state.value, "by": who, "reason": reason},
                      f"{who} set state to {state.value}" + (f": {reason}" if reason else ""))
+        return self._thread(t.id)
+
+    def _done_needs_review(self, agent: AgentRecord, t: Thread) -> Thread:
+        """An agent can't close its own work: 'done' means 'verified'."""
+        if t.state == ThreadState.verifying:
+            return t
+        mine = [m for m in self.store.thread_messages(t.id, 0, 10_000) if m.intent == Intent.result and m.sender == agent.id]
+        if not mine:
+            raise GuardError("result_required", "post a result first; it is verified before the thread is done", 409)
+        self.maybe_verify(agent, t, mine[-1])
         return self._thread(t.id)
 
     def update_blackboard(self, agent: AgentRecord, thread_id: str, patch: dict[str, Any]) -> Thread:
@@ -214,9 +273,16 @@ class Bus:
         self.store.save_thread(t)
         self._system(t.id, {"event": "paused", "reason": reason}, f"Thread paused: {reason}")
 
-    def _system(self, thread_id: str, payload: dict[str, Any], text: str) -> Envelope:
-        env = EnvelopeIn(thread_id=thread_id, intent=Intent.inform, payload=payload, text=text)
-        return self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system", signer=self.signer)
+    def _system(self, thread_id: str, payload: dict[str, Any], text: str, *, intent: Intent = Intent.inform,
+                to: str | None = None, artifacts: list[str] | None = None, memory_refs: list[str] | None = None) -> Envelope:
+        env = EnvelopeIn(thread_id=thread_id, intent=intent, payload=payload, text=text, to=Address(agent=to),
+                         artifacts=artifacts or [], memory_refs=memory_refs or [])
+        stored = self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system", signer=self.signer,
+                                   to_agent_id=to)
+        t = self._thread(thread_id)
+        t.message_count += 1
+        self.store.save_thread(t)
+        return stored
 
     # ------------------------------------------------------------- reading
     def deliver(self, reader_id: str, env: Envelope) -> Delivery:
@@ -225,7 +291,10 @@ class Bus:
         if untrusted:
             flags = injection_flags(env)
             notice = UNTRUSTED_NOTICE + (f" Flagged phrases: {', '.join(flags)}." if flags else "")
-        return Delivery(envelope=env, untrusted=untrusted, notice=notice)
+        rid = None if reader_id == HUMAN else reader_id
+        memory = self.memory_stubs_for(rid, env.memory_refs) if env.memory_refs else []
+        route = self.route_for(reader_id, env) if env.intent == Intent.request else None
+        return Delivery(envelope=env, untrusted=untrusted, notice=notice, memory=memory, route=route)
 
     def inbox(self, agent: AgentRecord, after: int = 0, limit: int = 100) -> list[Delivery]:
         return [self.deliver(agent.id, e) for e in self.store.inbox(agent.id, after, limit)]
@@ -237,14 +306,18 @@ class Bus:
         rid = reader.id if reader else HUMAN
         return [self.deliver(rid, e) for e in self.store.thread_messages(thread_id, after)]
 
-    def context_pack(self, reader: AgentRecord | None, thread_id: str, recent: int = 10) -> ContextPack:
+    def context_pack(self, reader: AgentRecord | None, thread_id: str, recent: int = 10,
+                     max_tokens: int | None = None) -> ContextPack:
         t = self._thread(thread_id)
         if reader is not None and reader.id not in t.participants and not self._can_join(reader, t):
             raise Forbidden("not a participant of this thread")
         msgs = self.store.thread_messages(thread_id, 0, 10_000)
         answered = {m.in_reply_to for m in msgs if m.intent in (Intent.result, Intent.reject, Intent.error) and m.in_reply_to}
         open_requests = [m for m in msgs if m.intent == Intent.request and m.seq not in answered]
-        results = [m for m in msgs if m.intent == Intent.result][-3:]
+        # Reviewers' verdicts live in t.verification; results here are the work itself.
+        review_reqs = {int(k) for k, m in (t.routing.get("messages") or {}).items() if m.get("kind") == "verification"}
+        work = [m for m in msgs if m.intent == Intent.result and m.in_reply_to not in review_reqs]
+        results = work[-3:]
         names = {a.id: a.name for a in self.store.list_agents()}
         names.update({HUMAN: HUMAN, SYSTEM: SYSTEM})
         budget = f"${t.spent_usd:.3f} of ${t.budget_usd:.2f}" if t.budget_usd is not None else f"${t.spent_usd:.2f} (no budget)"
@@ -253,17 +326,35 @@ class Bus:
             + (f", owned by {names.get(t.owner, t.owner)}" if t.owner else ", unclaimed")
             + f". {t.message_count} messages; spent {budget}.",
             "Participants: " + ", ".join(names.get(p, p) for p in t.participants) + ".",
-            f"Open requests: {len(open_requests)}. Results so far: {len([m for m in msgs if m.intent == Intent.result])}.",
+            f"Open requests: {len(open_requests)}. Results so far: {len(work)}.",
         ]
         if t.pause_reason:
             lines.append(f"Paused because: {t.pause_reason}.")
+        if t.assigned_to and not t.owner:
+            lines.append(f"Router assigned it to {names.get(t.assigned_to, t.assigned_to)} ({t.kind or 'request'}).")
+        v = t.verification
+        if v.get("status") == "pending":
+            lines.append(f"Waiting for verification by {names.get(v.get('verifier'), v.get('verifier'))}.")
+        elif v.get("status") in ("approved", "rejected", "overridden"):
+            lines.append(f"Verification: {v['status']} after {len(v.get('history', []))} review(s).")
         if t.blackboard:
             lines.append("Blackboard keys: " + ", ".join(sorted(t.blackboard)) + ".")
         rid = reader.id if reader else HUMAN
-        return ContextPack(
+        # Memory shared into the thread, plus anything referenced in it that this reader may open.
+        mid = reader.id if reader else None
+        memory = [self._view(mid, m, full=False).stub()
+                  for m in self.store.visible_memory(mid, thread_id=thread_id, limit=50)]
+        seen = {m.id for m in memory}
+        refs = [r for e in reversed(msgs) for r in e.memory_refs if r not in seen]
+        memory += [s for s in self.memory_stubs_for(mid, list(dict.fromkeys(refs))[:50]) if s.accessible]
+        if memory:
+            lines.append(f"Shared memory: {len(memory)} items (stubs below; open with GET /v1/memory/{{id}}).")
+        pack = ContextPack(
             thread=t, summary=" ".join(lines), open_requests=open_requests, latest_results=results,
-            recent=[self.deliver(rid, m) for m in msgs[-recent:]], notice=UNTRUSTED_NOTICE,
+            recent=[self.deliver(rid, m) for m in msgs[-recent:]] if recent > 0 else [],
+            memory=memory, notice=UNTRUSTED_NOTICE, max_tokens=max_tokens,
         )
+        return fit_to_budget(pack, max_tokens) if max_tokens else _measured(pack)
 
     # --------------------------------------------------------------- human
     def human_pause_agent(self, agent_ref: str, paused: bool) -> AgentRecord:
@@ -277,3 +368,59 @@ class Bus:
             return self.set_state(None, thread_id, ThreadState.paused, reason or "paused by observer")
         target = ThreadState.working if t.owner else ThreadState.open
         return self.set_state(None, thread_id, target)
+
+
+# ---------------------------------------------------------- token budgets
+
+CLIP_MIN_TOKENS = 50  # payloads at least this large may be replaced by stubs
+
+
+def _measured(pack: ContextPack) -> ContextPack:
+    pack.tokens_estimate = estimate_tokens(pack.model_dump_json())
+    return pack
+
+
+def _clip(env: Envelope) -> Envelope:
+    keys = list(env.payload)[:10]
+    return env.model_copy(update={
+        "payload": {"_clipped": True, "keys": keys, "tokens": estimate_tokens(env.payload)},
+        "text": (env.text[:200] + "...") if env.text and len(env.text) > 200 else env.text,
+    })
+
+
+def fit_to_budget(pack: ContextPack, max_tokens: int) -> ContextPack:
+    """Shrink a context pack until it fits, cheapest losses first:
+    1. replace large payloads in recent messages with stubs (keys + size),
+    2. drop the oldest recent messages,
+    3. clip large payloads in open requests and latest results,
+    4. drop memory stubs beyond the newest five.
+    The thread summary and the open requests themselves are always kept."""
+    omitted: dict[str, int] = {}
+
+    def size() -> int:
+        return _measured(pack).tokens_estimate
+
+    if size() <= max_tokens:
+        return pack
+    for d in sorted(pack.recent, key=lambda d: -estimate_tokens(d.envelope.payload)):
+        if size() <= max_tokens:
+            break
+        if not d.clipped and estimate_tokens(d.envelope.payload) > CLIP_MIN_TOKENS:
+            d.envelope, d.clipped = _clip(d.envelope), True
+            omitted["clipped_payloads"] = omitted.get("clipped_payloads", 0) + 1
+    while pack.recent and size() > max_tokens:
+        pack.recent.pop(0)
+        omitted["recent_messages"] = omitted.get("recent_messages", 0) + 1
+    for group in (pack.latest_results, pack.open_requests):
+        for i, e in enumerate(group):
+            if size() <= max_tokens:
+                break
+            if estimate_tokens(e.payload) > CLIP_MIN_TOKENS and not e.payload.get("_clipped"):
+                group[i] = _clip(e)
+                omitted["clipped_payloads"] = omitted.get("clipped_payloads", 0) + 1
+    while len(pack.memory) > 5 and size() > max_tokens:
+        pack.memory.pop()
+        omitted["memory_stubs"] = omitted.get("memory_stubs", 0) + 1
+    pack.truncated = bool(omitted)
+    pack.omitted = omitted
+    return _measured(pack)

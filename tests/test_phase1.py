@@ -1,4 +1,5 @@
 """Phase 1: live updates (SSE), signed envelopes, A2A bridge, agent framework."""
+# pylint: disable=redefined-outer-name  # pytest fixtures are injected by parameter name
 
 import socket
 import threading
@@ -14,16 +15,20 @@ from agentsmessenger import Bus, Client, MessengerError, Store
 from agentsmessenger.a2a import A2AClient, A2AProxy
 from agentsmessenger.agent import Agent, Result
 from agentsmessenger.models import Envelope
+from agentsmessenger.router import RouterConfig
 from agentsmessenger.server import create_app
 from agentsmessenger.signing import generate_keypair, verify_stored
 
 OBS = "obs_test"
+# These tests cover transport (SSE, signatures, A2A, framework); routing and the
+# default verification step are covered in test_router.py.
+NO_REVIEW = RouterConfig(verify=False)
 H = {"Authorization": f"Bearer {OBS}"}
 
 
 @pytest.fixture
 def app_client():
-    bus = Bus(Store())
+    bus = Bus(Store(), router=NO_REVIEW)
     http = TestClient(create_app(bus, observer_token=OBS))
 
     def agent(name, caps=(), key=None):
@@ -58,7 +63,7 @@ def test_observer_stream_and_auth(app_client):
 # ----------------------------------------------------------- signatures
 
 def test_signed_envelopes(app_client):
-    bus, http, agent = app_client
+    _, http, agent = app_client
     key = generate_keypair()
     signer = agent("signer", key=key)
     agent("beta")
@@ -157,7 +162,7 @@ def live(tmp_path, monkeypatch):
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-    app = create_app(Bus(Store(str(tmp_path / "db.sqlite"))), observer_token=OBS)
+    app = create_app(Bus(Store(str(tmp_path / "db.sqlite")), router=NO_REVIEW), observer_token=OBS)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     th = threading.Thread(target=server.run, daemon=True)
     th.start()

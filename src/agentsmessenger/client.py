@@ -63,21 +63,41 @@ class Client:
              thread_id: str | None = None, payload: dict[str, Any] | None = None, text: str | None = None,
              subject: str | None = None, in_reply_to: int | None = None, cost_usd: float = 0.0,
              budget_usd: float | None = None, idempotency_key: str | None = None,
-             artifacts: list[str] | None = None) -> dict[str, Any]:
+             artifacts: list[str] | None = None, memory_refs: list[str] | None = None,
+             prefer: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "intent": intent, "to": {"agent": to_agent, "capability": to_capability},
             "thread_id": thread_id, "payload": payload or {}, "text": text, "subject": subject,
             "in_reply_to": in_reply_to, "cost_usd": cost_usd, "budget_usd": budget_usd,
-            "idempotency_key": idempotency_key, "artifacts": artifacts or [],
+            "idempotency_key": idempotency_key, "artifacts": artifacts or [], "memory_refs": memory_refs or None,
+            "prefer": prefer,
         }
         body = {k: v for k, v in body.items() if v is not None}
         if self.signing_key:
             body["signature"] = sign(body, self.signing_key)
         return self._req("POST", "/v1/messages", json=body)
 
-    def request(self, capability: str, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
-        """Start a thread asking whoever offers `capability`."""
+    def request(self, capability: str | None, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        """Start a thread asking whoever offers `capability`. With capability=None the
+        router works out what kind of request it is and picks the best agent."""
         return self.send("request", to_capability=capability, payload=payload, **kw)
+
+    def ask(self, text: str, payload: dict[str, Any] | None = None, prefer: str | None = None, **kw: Any) -> dict[str, Any]:
+        """Plain-language request; the router picks who does it (prefer: balanced | cheapest | quality)."""
+        return self.send("request", payload=payload or {}, text=text, subject=kw.pop("subject", text[:120]),
+                         prefer=prefer, **kw)
+
+    def route_preview(self, text: str | None = None, capability: str | None = None, payload: dict[str, Any] | None = None,
+                      prefer: str | None = None) -> dict[str, Any]:
+        """Who the router would pick for this request, and why, without sending it."""
+        body = {"text": text, "capability": capability, "payload": payload or {}, "prefer": prefer}
+        return self._req("POST", "/v1/route/preview", json=body)
+
+    def review(self, envelope: dict[str, Any], approve: bool, notes: str = "", issues: list[Any] | None = None) -> dict[str, Any]:
+        """Answer a verification request."""
+        return self.reply(envelope, "result", {"verdict": "approve" if approve else "reject", "notes": notes,
+                                               "issues": issues or []}, text=("Approved" if approve else "Rejected") +
+                          (f": {notes}" if notes else ""))
 
     def reply(self, envelope: dict[str, Any], intent: str, payload: dict[str, Any] | None = None, **kw: Any) -> dict[str, Any]:
         return self.send(intent, thread_id=envelope["thread_id"], in_reply_to=envelope["seq"], payload=payload, **kw)
@@ -132,8 +152,11 @@ class Client:
     def messages(self, thread_id: str, after: int = 0) -> list[dict[str, Any]]:
         return self._req("GET", f"/v1/threads/{thread_id}/messages", params={"after": after})
 
-    def context(self, thread_id: str, recent: int = 10) -> dict[str, Any]:
-        return self._req("GET", f"/v1/threads/{thread_id}/context", params={"recent": recent})
+    def context(self, thread_id: str, recent: int = 10, max_tokens: int | None = None) -> dict[str, Any]:
+        params: dict[str, Any] = {"recent": recent}
+        if max_tokens:
+            params["max_tokens"] = max_tokens
+        return self._req("GET", f"/v1/threads/{thread_id}/context", params=params)
 
     def claim(self, thread_id: str) -> dict[str, Any]:
         return self._req("POST", f"/v1/threads/{thread_id}/claim")
@@ -143,3 +166,32 @@ class Client:
 
     def blackboard(self, thread_id: str, **patch: Any) -> dict[str, Any]:
         return self._req("PATCH", f"/v1/threads/{thread_id}/blackboard", json=patch)
+
+    # --------------------------------------------------------------- memory
+    def remember(self, key: str, value: Any, *, visibility: str = "private", summary: str | None = None,
+                 tags: list[str] | None = None, shared_with: list[str] | None = None,
+                 threads: list[str] | None = None, source: str | None = None) -> dict[str, Any]:
+        """Create or update one of this agent's memory items. visibility: private | shared | public."""
+        body = {"key": key, "value": value, "visibility": visibility, "summary": summary, "tags": tags or [],
+                "shared_with": shared_with or [], "threads": threads or [], "source": source}
+        return self._req("POST", "/v1/memory", json={k: v for k, v in body.items() if v is not None})
+
+    def memories(self, **filters: Any) -> list[dict[str, Any]]:
+        """Stubs of memory this agent may read. Filters: q, tag, visibility, owner, thread_id,
+        since, include_values, max_tokens, limit."""
+        params = {k: (str(v).lower() if isinstance(v, bool) else v) for k, v in filters.items() if v is not None}
+        return self._req("GET", "/v1/memory", params=params)
+
+    def recall(self, memory_id: str, path: str | None = None) -> dict[str, Any]:
+        """Full value of one item (or just `path` inside it)."""
+        return self._req("GET", f"/v1/memory/{memory_id}", params={"path": path} if path else None)
+
+    def share(self, memory_id: str, *, visibility: str | None = None, add_agents: list[str] | None = None,
+              remove_agents: list[str] | None = None, add_threads: list[str] | None = None,
+              remove_threads: list[str] | None = None) -> dict[str, Any]:
+        body = {"visibility": visibility, "add_agents": add_agents or [], "remove_agents": remove_agents or [],
+                "add_threads": add_threads or [], "remove_threads": remove_threads or []}
+        return self._req("POST", f"/v1/memory/{memory_id}/share", json={k: v for k, v in body.items() if v is not None})
+
+    def forget(self, memory_id: str) -> dict[str, Any]:
+        return self._req("DELETE", f"/v1/memory/{memory_id}")

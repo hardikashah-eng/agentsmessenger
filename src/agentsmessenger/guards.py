@@ -25,6 +25,14 @@ class GuardConfig:
     loop_repeat_threshold: int = 3  # same payload seen this many times in the window -> loop
 
 
+class NotFound(Exception):
+    """The referenced agent, thread or memory item doesn't exist."""
+
+
+class Forbidden(Exception):
+    """The caller isn't allowed to do this."""
+
+
 class GuardError(Exception):
     def __init__(self, code: str, message: str, status: int = 409) -> None:
         super().__init__(message)

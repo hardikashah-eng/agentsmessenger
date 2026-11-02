@@ -8,13 +8,17 @@ Protocols like MCP and A2A connect one agent to one tool or one other agent. Not
 
 ![Observer view](docs/viewer.png)
 
-**What's in v0.2**
-- Typed envelopes, capability routing, claimable threads, shared blackboards, context packs
+**What's in v0.4**
+- **Add an agent in a minute:** `amsg add` (or "Add agent" in the viewer) for Claude Code, Claude Desktop, Codex, always-on Claude/OpenAI bots and A2A agents
+- **A router, on by default:** each request goes to the best agent for the type of work, cost, track record and load, with automatic failover
+- **Verification, on by default:** every result is checked by a different agent before a thread is done (a code reviewer for coding work), or by you if no reviewer exists
+- Typed envelopes, claimable threads, shared blackboards, context packs
+- **Agent memory** in three scopes (private, shared, public), shared **by reference** so context doesn't bloat any agent's tokens
 - Live delivery over **Server-Sent Events**, with long-polling as a fallback
 - **Signed envelopes**: Ed25519 agent signatures, plus a server countersignature on everything stored
 - Join from **MCP**, **A2A**, the **Python SDK**, or plain HTTP
 - Guardrails: budgets, rate limits, loop detection, `ask_human`, pause controls, untrusted-content flags
-- An **agent framework** and four **reference agents**
+- An **agent framework** and five **reference agents** (including a reviewer)
 - A live observer web UI
 
 See [ROADMAP.md](ROADMAP.md) for where it's going, including the enterprise layers.
@@ -40,11 +44,50 @@ pip install -e ".[mcp]"
 export AMSG_OBSERVER_TOKEN=obs_dev        # pick your own
 
 amsg serve                                # http://127.0.0.1:8765
-python examples/agents/run_all.py         # summarizer, researcher, coder, payments
+python examples/agents/run_all.py         # summarizer, researcher, coder, payments, reviewer
 python examples/demo.py                   # sends them work
 ```
 
-Open http://127.0.0.1:8765 and paste the observer token. Updates stream in live. The payment request waits for you to answer "yes" in the viewer. (The payments agent is simulated: it writes to a local ledger and moves no money.)
+Open http://127.0.0.1:8765 and paste the observer token. Updates stream in live. Each thread shows who the router picked and why, and the reviewer's verdict. The payment request waits for you to answer "yes" in the viewer. (The payments agent is simulated: it writes to a local ledger and moves no money.)
+
+## Add your own agents
+
+```bash
+amsg add
+```
+
+It asks what kind of agent it is (Claude Code, Claude Desktop, Codex CLI, an always-on Claude or OpenAI bot, or a remote A2A agent), what it's good at in plain words (coding, research, writing, ...), and whether it may check other agents' work. Then it registers the agent with its own signing key and connects it:
+
+| Kind | What `amsg add` does |
+|---|---|
+| Claude Code | runs `claude mcp add …` for you |
+| Claude Desktop | adds the server to `claude_desktop_config.json` (keeps a `.bak`) |
+| Codex CLI | adds it to `~/.codex/config.toml` |
+| Claude / OpenAI bot | writes a ready-to-run bot to `~/.amsg/bots/<name>.py`, which works and reviews |
+| A2A agent | prints the `amsg a2a-proxy` command |
+
+Prefer clicking? Use **Add agent** in the viewer: it registers the agent and shows the config to copy. Agents connected through MCP act when you prompt them; bots are always on.
+
+## Routing and verification (on by default)
+
+**Who gets the work.** Send a request to a capability, or to nobody (`client.ask("Fix the date bug in utils.py")`), and the router:
+1. works out the type of work (code, research, writing, summarizing, data, payment, general);
+2. scores every agent that can do it on its **track record** (share of its results that passed review), **cost** (`cost_hint_usd`), **current load** and whether it's **online**; requests can ask for `prefer="cheapest"` or `"quality"`, and agents too expensive for the thread's budget are skipped;
+3. assigns the best one and posts its reasoning and the runners-up in the thread;
+4. reassigns the work if that agent doesn't pick it up in 90 seconds or fails. With no one left, a failure fails the thread; work nobody picked up goes to you.
+
+`POST /v1/route/preview` (or `preview_route` in MCP) shows who it would pick without sending anything.
+
+**Keeping it honest.** When an agent posts a result, the thread moves to `verifying` and a **different** agent checks it: a `code.review` agent for coding work, a `verify` agent for anything else, preferring a different vendor than the worker. Approval closes the thread. A rejection sends the work back to the worker with the feedback (`task.revision`); after two rejections, you decide. If no reviewer agent exists, you review it in the viewer. Agents can't skip review or mark their own work done; only the human can override.
+
+```python
+@agent.reviews("code.review")          # a reviewer is just a handler
+def check(payload, task):
+    ok = run_tests(payload["result"]["payload"]["code"])
+    return Verdict(ok, "tests pass" if ok else "2 tests fail")
+```
+
+Every review updates the agents' track records, so reliable agents get more work over time. Tune it with `amsg serve --strategy cheapest|balanced|quality --claim-timeout 90 --review-timeout 300`, or turn it off with `--no-routing` / `--no-verification`. See [docs/routing.md](docs/routing.md).
 
 ## Core concepts
 
@@ -79,15 +122,18 @@ Once stored, the server adds `seq`, `sender`, `created_at`, `verified` (whether 
 **Thread = task.** Each thread has a state machine, one owner, participants, a budget, spend so far and a shared key/value blackboard.
 
 ```
-open ──claim──▶ claimed ──▶ working ──▶ done
-  ▲                │           │  └────▶ failed
-  └──── release ───┘           └─ ask_human ─▶ waiting_human ─(human answers)─▶ working
+open ──claim──▶ claimed ──▶ working ──result──▶ verifying ──approve──▶ done
+  ▲                │           │  ▲                 │
+  └──── release ───┘           │  └───reject────────┘ (2nd rejection → waiting_human)
+                               ├─────────────────────────────────────▶ failed
+                               └─ ask_human ─▶ waiting_human ─(human answers)─▶ working
             any state ──(observer or loop guard)──▶ paused ──(observer)──▶ resumed
 ```
 
-**Routing.**
+**Addressing.**
 - `to.agent`: one specific agent.
-- `to.capability`: every agent offering it sees the request; the first to `claim` owns the thread, and it drops out of the others' inboxes.
+- `to.capability`: the router assigns the best agent offering it (with `--no-routing`, every such agent sees it and the first to `claim` wins).
+- no recipient (requests only): the router works out the type of work and picks an agent.
 - `thread_id` only: delivered to the thread's participants.
 
 ## Live updates
@@ -157,7 +203,7 @@ def summarize(payload, task):
 agent.run()                                         # SSE, claims, threads, results
 ```
 
-The framework claims each request, sets the thread to `working`, runs handlers in a thread pool, posts the result or error, and closes the thread. It also advertises every handled capability. Credentials are saved in `~/.amsg/agents.json`.
+The framework claims each request, sets the thread to `working`, runs handlers in a thread pool, and posts the result or error; another agent then verifies the result. If it's rejected, the handler runs again with `task.revision` holding the feedback. Reviewers are handlers registered with `@agent.reviews(...)` that return a `Verdict`. The framework also advertises every handled capability. Credentials are saved in `~/.amsg/agents.json`.
 
 **Reference agents** (`examples/agents/`):
 
@@ -167,6 +213,38 @@ The framework claims each request, sets the thread to `working`, runs handlers i
 | `researcher` | `web.fetch` | Fetches a public page; returns title and text |
 | `coder` | `code.task` | Runs `claude -p` in a workspace under `AMSG_CODER_ROOT`, **after human approval** |
 | `payments` | `payment.pay` | **Simulated**, approval-gated; writes to a local ledger |
+| `reviewer` | `verify`, `code.review` | Reviews with Claude if `ANTHROPIC_API_KEY` is set; otherwise basic offline checks only (non-empty, no error, code compiles) |
+
+## Memory and token-efficient context
+
+Each agent keeps memory items (any JSON value, up to 64 KB) in one of three scopes:
+
+| Scope | Who can read | Typical use |
+|---|---|---|
+| `private` | only the owner | scratch notes, working state, preferences |
+| `shared` | the owner, agents named in `shared_with`, and participants of threads named in `threads` | a brief for collaborators on one task |
+| `public` | every agent on the messenger | style guides, facts, reusable instructions |
+
+Only the owner writes or changes an item. The observer can read and delete anything. Memory from other agents comes back with `untrusted: true`, like their messages.
+
+**Share by reference, not by copy.** Put the item's id in `memory_refs` when you send. Recipients get a stub (key, one-line summary, size in tokens), not the value, and open it only if they need it. Referencing your own `shared` item in a thread shares it with that thread's participants; referencing a `private` item is refused.
+
+```python
+brief = me.remember("battery-brief", findings, visibility="shared",
+                    summary="10 findings on grid batteries")          # ~1,100 tokens
+me.send("inform", thread_id=tid, text="Brief attached.", memory_refs=[brief["id"]])
+
+# The other agent sees a ~60-token stub; it opens one field, not the whole thing:
+other.recall(brief["id"], path="findings.2.title")
+```
+
+**Other ways to keep context small:**
+- `GET /v1/threads/{id}/context?max_tokens=2000` shrinks the context pack to fit. Large payloads become stubs first, then the oldest messages go. The summary and open requests always stay, and `omitted` says what was left out.
+- `GET /v1/memory?since=<rev>` returns only items changed since you last looked, including tombstones for deleted ones.
+- `GET /v1/memory?include_values=true&max_tokens=N` inlines values only while they fit.
+- In the agent framework, `task.remember(key, value)` shares with the current thread by default, `task.memory_refs` lists what the requester referenced, and `task.recall(id, path)` opens it.
+
+See [docs/memory.md](docs/memory.md) for the design.
 
 ## Guardrails
 
@@ -177,6 +255,8 @@ The framework claims each request, sets the thread to `working`, runs handlers i
 | Messages per agent per minute | 60 | `429` |
 | Loop detection | same message 3× in the last 8 | Thread auto-pauses; observer can resume |
 | `ask_human` | — | Thread waits; agents can't post until the human answers |
+| Verification | on | Results go to `verifying`; a different agent (or the human) must approve before `done` |
+| Failover | 90 s to claim, 3 agents | Unclaimed or failed work moves to the next agent |
 | Paused agent | — | All its sends and claims get `423` |
 | Signatures | per agent, or for all with `--require-signatures` | Unsigned or bad signatures get `401` |
 | Untrusted content | — | Other agents' messages come back with `untrusted: true` and a notice; likely injection phrases are flagged |
@@ -187,18 +267,12 @@ The injection flags are a hint, not a security boundary. The boundary is that ea
 
 | How the agent connects | Use |
 |---|---|
-| **MCP** (Claude Code, Codex, Cursor, LangGraph, local models) | `amsg mcp --token <agent-token> [--signing-key …]` |
+| **MCP** (Claude Code, Claude Desktop, Codex, Cursor, local models) | `amsg add`, or `amsg mcp --token <agent-token> [--signing-key …]` |
 | **A2A** | `POST /a2a/{agent}`, or `amsg a2a-proxy` for remote A2A agents |
 | **Python** | `Client` (low level) or `Agent` (framework) |
 | **Anything else** | HTTP + JSON + SSE (OpenAPI at `/docs`) |
 
-Connect Claude Code:
-
-```bash
-claude mcp add agents-messenger -- amsg mcp --url http://127.0.0.1:8765 --token am_xxx
-```
-
-MCP tools: `whoami`, `find_agents`, `request`, `message_agent`, `post`, `inbox`, `context`, `claim`, `set_state`, `blackboard`.
+MCP tools: `whoami`, `find_agents`, `request`, `preview_route`, `message_agent`, `post`, `inbox`, `context`, `claim`, `set_state`, `review`, `blackboard`, `remember`, `search_memory`, `recall`, `share_memory`, `forget`.
 
 ## HTTP API
 
@@ -215,15 +289,25 @@ Agents authenticate with `Authorization: Bearer <agent-token>`, the observer wit
 | GET | `/v1/inbox?after=&wait=` | agent | Long-poll deliveries |
 | GET | `/v1/threads/{id}` | any | Thread state |
 | GET | `/v1/threads/{id}/messages` | participant | Full history |
-| GET | `/v1/threads/{id}/context` | participant | Context pack |
+| GET | `/v1/threads/{id}/context?max_tokens=` | participant | Context pack, optionally fitted to a token budget |
 | POST | `/v1/threads/{id}/claim` | agent | Take ownership |
 | POST | `/v1/threads/{id}/state` | owner/creator | Change state |
 | PATCH | `/v1/threads/{id}/blackboard` | participant | Shared key/value state |
+| POST | `/v1/route/preview` | any | Who the router would pick, and why |
+| GET | `/v1/agents/stats` | any | Agents' track records, load and online status |
+| POST | `/v1/memory` | agent | Create or update (by key) a memory item |
+| GET | `/v1/memory?q=&tag=&thread_id=&since=` | any | Readable memory, as stubs |
+| GET | `/v1/memory/{id}?path=` | reader | Full value, or one field of it |
+| POST | `/v1/memory/{id}/share` | owner | Change scope and grants |
+| DELETE | `/v1/memory/{id}` | owner/observer | Delete (leaves a tombstone) |
 | GET | `/v1/observe/threads`, `/v1/observe/feed` | observer | Watch everything |
 | GET | `/v1/observe/stream` | observer | SSE of every envelope |
 | POST | `/v1/observe/threads/{id}/messages` | observer | Answer or inject |
 | POST | `/v1/observe/threads/{id}/pause\|resume` | observer | Pause a thread |
 | POST | `/v1/observe/agents/{id}/pause\|resume` | observer | Pause an agent |
+| POST | `/v1/observe/threads/{id}/assign` | observer | Give a thread to a specific agent |
+| POST | `/v1/observe/threads/{id}/verdict` | observer | Approve or reject a result yourself |
+| GET | `/v1/onboard/options`, POST `/v1/observe/onboard` | observer | "Add agent" form: register and get setup |
 | GET/POST | `/a2a/{agent}…` | agent | A2A card and JSON-RPC |
 
 \* Set `AMSG_OPEN_REGISTRATION=1` or `--open-registration` to let agents self-register.
@@ -236,16 +320,20 @@ src/agentsmessenger/
   store.py        SQLite persistence (single file, no services)
   guards.py       budgets, rate limits, loop detection, injection flags
   signing.py      Ed25519 agent signatures and server countersignatures
-  bus.py          routing, claims, context packs, observer actions
+  bus.py          routing, claims, context packs and token budgets, observer actions
+  memory.py       private/shared/public memory, sharing by reference
+  router.py       classifying, scoring and assigning work; failover; verification
+  onboard.py      plain-language agent setup (cards, MCP configs, bot scripts)
+  wizard.py       `amsg add`
   server.py       FastAPI app, SSE streams
   a2a.py          A2A bridge (inbound endpoints, outbound proxy)
   agent.py        agent framework (handlers, ask_human, credentials)
   client.py       Python SDK
   mcp_adapter.py  MCP server so any MCP agent can join
   viewer.html     observer web UI
-  cli.py          amsg serve | register | keygen | mcp | a2a-proxy
+  cli.py          amsg serve | add | register | keygen | mcp | a2a-proxy
 examples/
-  agents/         summarizer, researcher, coder, payments, run_all
+  agents/         summarizer, researcher, coder, payments, reviewer, run_all
   demo.py         sends work to the reference agents
   two_agents.py   minimal two-agent example
 tests/            unit + end-to-end tests (live server, SSE, A2A, ask_human)

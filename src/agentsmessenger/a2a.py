@@ -38,6 +38,7 @@ STATE_MAP = {
     ThreadState.claimed: "submitted",
     ThreadState.working: "working",
     ThreadState.waiting_human: "input-required",
+    ThreadState.verifying: "working",
     ThreadState.paused: "working",
     ThreadState.done: "completed",
     ThreadState.failed: "failed",
@@ -148,7 +149,7 @@ def mount_a2a(app: FastAPI, bus: Bus) -> None:
     async def rpc(agent: str, request: Request, authorization: str | None = Header(None)) -> JSONResponse:
         try:
             body = await request.json()
-        except Exception:
+        except ValueError:
             return _err(None, PARSE_ERROR, "parse error")
         rid = body.get("id") if isinstance(body, dict) else None
         if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
@@ -340,11 +341,11 @@ class A2AProxy:
             else:
                 self.messenger.reply(e, "error", {**payload, "_a2a": meta}, text=text or f"remote task {state}")
                 self.messenger.set_state(tid, "failed", f"remote task {state}")
-        except Exception as ex:  # report, don't crash the proxy
+        except Exception as ex:  # pylint: disable=broad-exception-caught  # report, don't crash the proxy
             try:
                 self.messenger.reply(e, "error", {"error": str(ex)}, text=f"A2A proxy error: {ex}")
                 self.messenger.set_state(tid, "failed", "proxy error")
-            except Exception:
+            except Exception:  # pylint: disable=broad-exception-caught  # best effort while already failing
                 pass
 
     def run(self, stop: Any = None) -> None:

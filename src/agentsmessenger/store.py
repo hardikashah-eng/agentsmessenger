@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Iterable
 
-from .models import AgentCard, AgentRecord, Envelope, EnvelopeIn, Thread, ThreadState, utcnow
+from .models import AgentCard, AgentRecord, Envelope, EnvelopeIn, MemoryItem, Thread, ThreadState, utcnow
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS agents (
@@ -51,7 +51,38 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS ix_messages_thread ON messages(thread_id, seq);
 CREATE INDEX IF NOT EXISTS ix_messages_agent ON messages(to_agent, seq);
 CREATE INDEX IF NOT EXISTS ix_messages_cap ON messages(to_capability, seq);
+CREATE TABLE IF NOT EXISTS memory (
+  id TEXT PRIMARY KEY,
+  owner TEXT NOT NULL,
+  key TEXT NOT NULL,
+  visibility TEXT NOT NULL,
+  rev INTEGER NOT NULL,
+  deleted INTEGER NOT NULL DEFAULT 0,
+  data TEXT NOT NULL,
+  UNIQUE (owner, key)
+);
+CREATE INDEX IF NOT EXISTS ix_memory_rev ON memory(rev);
+CREATE TABLE IF NOT EXISTS memory_grants (
+  memory_id TEXT NOT NULL,
+  kind TEXT NOT NULL,      -- agent | thread
+  target TEXT NOT NULL,
+  PRIMARY KEY (memory_id, kind, target)
+);
+CREATE INDEX IF NOT EXISTS ix_grants_target ON memory_grants(kind, target);
+CREATE TABLE IF NOT EXISTS agent_stats (
+  agent_id TEXT PRIMARY KEY,
+  assigned INTEGER NOT NULL DEFAULT 0,
+  approved INTEGER NOT NULL DEFAULT 0,
+  rejected INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  timeouts INTEGER NOT NULL DEFAULT 0,
+  reviews INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0
+);
 """
+
+STAT_FIELDS = ("assigned", "approved", "rejected", "failed", "timeouts", "reviews", "cost_usd")
+ACTIVE_STATES = ("claimed", "working", "verifying")
 
 
 def _hash(token: str) -> str:
@@ -262,6 +293,10 @@ class Store:
         ).fetchall()
         return [self._env(r) for r in rows]
 
+    def get_message(self, seq: int) -> Envelope | None:
+        r = self._db.execute("SELECT seq, data FROM messages WHERE seq=?", (seq,)).fetchone()
+        return self._env(r) if r else None
+
     def last_messages(self, thread_id: str, n: int) -> list[Envelope]:
         rows = self._db.execute(
             "SELECT seq, data FROM messages WHERE thread_id=? ORDER BY seq DESC LIMIT ?", (thread_id, n)
@@ -291,7 +326,8 @@ class Store:
             # Capability broadcasts stop going to others once someone else owns the thread.
             if env.to.capability and env.to.agent is None:
                 t = self.get_thread(env.thread_id)
-                if t and t.owner and t.owner != agent_id and agent_id not in t.participants:
+                taken_by = t.owner or t.assigned_to if t else None
+                if t and taken_by and taken_by != agent_id and agent_id not in t.participants:
                     continue
             out.append(env)
         return out
@@ -299,3 +335,113 @@ class Store:
     def messages_since(self, after: int, limit: int = 200) -> Iterable[Envelope]:
         rows = self._db.execute("SELECT seq, data FROM messages WHERE seq>? ORDER BY seq LIMIT ?", (after, limit)).fetchall()
         return [self._env(r) for r in rows]
+
+    # ------------------------------------------------------------- memory
+    def _mem(self, r: sqlite3.Row) -> MemoryItem:
+        item = MemoryItem.model_validate_json(r["data"])
+        grants = self._db.execute("SELECT kind, target FROM memory_grants WHERE memory_id=? ORDER BY target",
+                                  (item.id,)).fetchall()
+        item.shared_with = [g[1] for g in grants if g[0] == "agent"]
+        item.threads = [g[1] for g in grants if g[0] == "thread"]
+        return item
+
+    def get_memory(self, memory_id: str) -> MemoryItem | None:
+        r = self._db.execute("SELECT * FROM memory WHERE id=?", (memory_id,)).fetchone()
+        return self._mem(r) if r else None
+
+    def memory_by_key(self, owner: str, key: str) -> MemoryItem | None:
+        r = self._db.execute("SELECT * FROM memory WHERE owner=? AND key=?", (owner, key)).fetchone()
+        return self._mem(r) if r else None
+
+    def count_memory(self, owner: str) -> int:
+        return int(self._db.execute("SELECT COUNT(*) FROM memory WHERE owner=? AND deleted=0", (owner,)).fetchone()[0])
+
+    def save_memory(self, item: MemoryItem) -> MemoryItem:
+        """Insert or replace, bump the global revision, and rewrite grants."""
+        with self._lock, self._db:
+            rev = int(self._db.execute("SELECT COALESCE(MAX(rev), 0) + 1 FROM memory").fetchone()[0])
+            item.rev = rev
+            data = item.model_dump_json(exclude={"shared_with", "threads"})
+            self._db.execute(
+                "INSERT INTO memory(id, owner, key, visibility, rev, deleted, data) VALUES (?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET visibility=excluded.visibility, rev=excluded.rev, "
+                "deleted=excluded.deleted, data=excluded.data",
+                (item.id, item.owner, item.key, item.visibility.value, rev, int(item.deleted), data),
+            )
+            self._db.execute("DELETE FROM memory_grants WHERE memory_id=?", (item.id,))
+            self._db.executemany("INSERT OR IGNORE INTO memory_grants VALUES (?,?,?)",
+                                 [(item.id, "agent", a) for a in item.shared_with]
+                                 + [(item.id, "thread", t) for t in item.threads])
+        return item
+
+    def visible_memory(self, reader: str | None, *, q: str | None = None, tag: str | None = None,
+                       visibility: str | None = None, owner: str | None = None, thread_id: str | None = None,
+                       since: int | None = None, limit: int = 50) -> list[MemoryItem]:
+        """Items `reader` may read (reader=None is the observer: everything).
+        Deleted items only appear as tombstones when `since` is given."""
+        where, params = [], []
+        if reader is not None:
+            where.append(
+                "(m.owner = ? OR m.visibility = 'public' OR (m.visibility = 'shared' AND m.id IN ("
+                " SELECT memory_id FROM memory_grants WHERE (kind='agent' AND target=?)"
+                " OR (kind='thread' AND target IN (SELECT thread_id FROM participants WHERE agent_id=?)))))")
+            params += [reader, reader, reader]
+        if thread_id:
+            where.append("m.id IN (SELECT memory_id FROM memory_grants WHERE kind='thread' AND target=?)")
+            params.append(thread_id)
+        if visibility:
+            where.append("m.visibility = ?")
+            params.append(visibility)
+        if owner:
+            where.append("m.owner = ?")
+            params.append(owner)
+        if since is not None:
+            where.append("m.rev > ?")
+            params.append(since)
+        else:
+            where.append("m.deleted = 0")
+        if q:
+            where.append("(m.key LIKE ? OR json_extract(m.data, '$.summary') LIKE ?)")
+            params += [f"%{q}%", f"%{q}%"]
+        if tag:
+            where.append("EXISTS (SELECT 1 FROM json_each(json_extract(m.data, '$.tags')) WHERE value = ?)")
+            params.append(tag)
+        sql = "SELECT m.* FROM memory m" + (" WHERE " + " AND ".join(where) if where else "")
+        sql += " ORDER BY m.rev " + ("ASC" if since is not None else "DESC") + " LIMIT ?"
+        return [self._mem(r) for r in self._db.execute(sql, [*params, limit]).fetchall()]
+
+    def is_participant(self, thread_id: str, agent_id: str) -> bool:
+        return self._db.execute("SELECT 1 FROM participants WHERE thread_id=? AND agent_id=?",
+                                (thread_id, agent_id)).fetchone() is not None
+
+    # -------------------------------------------------------- agent stats
+    def bump_stats(self, agent_id: str, **deltas: float) -> None:
+        """Add to an agent's track record (used by the router)."""
+        bad = set(deltas) - set(STAT_FIELDS)
+        if bad:
+            raise ValueError(f"unknown stats: {bad}")
+        sets = ", ".join(f"{k} = {k} + ?" for k in deltas)
+        with self._lock, self._db:
+            self._db.execute("INSERT OR IGNORE INTO agent_stats(agent_id) VALUES (?)", (agent_id,))
+            self._db.execute(f"UPDATE agent_stats SET {sets} WHERE agent_id = ?", [*deltas.values(), agent_id])
+
+    def stats(self, agent_id: str) -> dict[str, float]:
+        r = self._db.execute("SELECT * FROM agent_stats WHERE agent_id=?", (agent_id,)).fetchone()
+        return {k: (r[k] if r else 0) for k in STAT_FIELDS}
+
+    def load(self, agent_id: str) -> int:
+        """Threads this agent is assigned to or working on right now."""
+        r = self._db.execute(
+            "SELECT COUNT(*) FROM threads WHERE json_extract(data, '$.state') IN (?,?,?,?) AND "
+            "(json_extract(data, '$.owner') = ? OR (json_extract(data, '$.assigned_to') = ? "
+            " AND json_extract(data, '$.owner') IS NULL))",
+            ("open", *ACTIVE_STATES, agent_id, agent_id),
+        ).fetchone()
+        return int(r[0])
+
+    def threads_in_states(self, states: Iterable[str], limit: int = 500) -> list[Thread]:
+        states = list(states)
+        rows = self._db.execute(
+            f"SELECT data FROM threads WHERE json_extract(data, '$.state') IN ({','.join('?' * len(states))}) "
+            "ORDER BY updated_at LIMIT ?", [*states, limit]).fetchall()
+        return [Thread.model_validate_json(r[0]) for r in rows]

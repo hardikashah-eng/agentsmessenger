@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import os
 import secrets
+from contextlib import asynccontextmanager
 from importlib import resources
 from typing import Any, AsyncIterator, Callable
 
@@ -14,9 +16,16 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from .a2a import mount_a2a
 from .bus import Bus, Forbidden, NotFound
 from .guards import GuardError
-from .models import AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent, Thread, ThreadState
+from . import onboard
+from .router import classify, reliability
+from .signing import generate_keypair
+from .models import (
+    AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent, MemoryItem, MemoryShare, MemoryStub,
+    MemoryWrite, Thread, ThreadState, Visibility,
+)
 
 
 class Registered(BaseModel):
@@ -39,19 +48,65 @@ class PauseBody(BaseModel):
     reason: str | None = None
 
 
+class AssignBody(BaseModel):
+    agent: str
+
+
+class VerdictBody(BaseModel):
+    verdict: str
+    notes: str = ""
+
+
+class OnboardBody(BaseModel):
+    name: str
+    kind: str
+    skills: list[str]
+    can_review: bool | None = None
+    cost_hint_usd: float | None = None
+    description: str = ""
+    owner: str = ""
+    remote_url: str | None = None
+
+
+class RoutePreview(BaseModel):
+    text: str | None = None
+    capability: str | None = None
+    payload: dict[str, Any] = {}
+    prefer: str | None = None
+
+
+log = logging.getLogger("agentsmessenger")
+
+
 def _bearer(authorization: str | None) -> str | None:
     if authorization and authorization.lower().startswith("bearer "):
         return authorization[7:].strip()
     return None
 
 
-def create_app(bus: Bus | None = None, observer_token: str | None = None, open_registration: bool | None = None) -> FastAPI:
+def create_app(bus: Bus | None = None, observer_token: str | None = None, open_registration: bool | None = None,
+               tick_seconds: float = 2.0) -> FastAPI:
     bus = bus or Bus()
     observer_token = observer_token or os.environ.get("AMSG_OBSERVER_TOKEN") or ("obs_" + secrets.token_urlsafe(24))
     if open_registration is None:
         open_registration = os.environ.get("AMSG_OPEN_REGISTRATION", "0") == "1"
 
-    app = FastAPI(title="Agents Messenger", version="0.2.0",
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async def ticker() -> None:
+            # Reassign work nobody picked up and reviews nobody answered.
+            while True:
+                await asyncio.sleep(tick_seconds)
+                try:
+                    bus.tick()
+                except Exception:  # pylint: disable=broad-exception-caught  # keep the loop alive; log and retry
+                    log.exception("router tick failed")
+        task = asyncio.create_task(ticker()) if tick_seconds > 0 else None
+        yield
+        if task:
+            task.cancel()
+
+    app = FastAPI(title="Agents Messenger", version="0.4.0", lifespan=lifespan,
                   description="An agent-native messenger: agents talk, humans observe.")
     app.state.bus = bus
     app.state.observer_token = observer_token
@@ -79,8 +134,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "agent bearer token required")
         try:
             return bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid agent token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid agent token") from exc
 
     def observer_auth(authorization: str | None = Header(None)) -> None:
         if not is_observer(_bearer(authorization)):
@@ -94,8 +149,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "bearer token required")
         try:
             return bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid token") from exc
 
     # ------------------------------------------------------------- directory
     @app.get("/health")
@@ -157,8 +212,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             raise HTTPException(401, "agent token required")
         try:
             agent = bus.authenticate(tok)
-        except Forbidden:
-            raise HTTPException(401, "invalid agent token")
+        except Forbidden as exc:
+            raise HTTPException(401, "invalid agent token") from exc
         start = int(last_event_id) if last_event_id and last_event_id.isdigit() else after
 
         def fetch(cursor: int) -> list[tuple[int, str, str]]:
@@ -178,8 +233,10 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
         return bus.read_thread(who, thread_id, after)
 
     @app.get("/v1/threads/{thread_id}/context", response_model=ContextPack)
-    def context(thread_id: str, recent: int = Query(10, le=100), who: AgentRecord | None = Depends(any_auth)) -> ContextPack:
-        return bus.context_pack(who, thread_id, recent)
+    def context(thread_id: str, recent: int = Query(10, ge=0, le=100), max_tokens: int | None = Query(None, ge=200, le=200_000),
+                who: AgentRecord | None = Depends(any_auth)) -> ContextPack:
+        """State, not scrollback. With max_tokens, the pack is shrunk to fit (see `omitted`)."""
+        return bus.context_pack(who, thread_id, recent, max_tokens)
 
     @app.post("/v1/threads/{thread_id}/claim", response_model=Thread)
     def claim(thread_id: str, agent: AgentRecord = Depends(agent_auth)) -> Thread:
@@ -192,6 +249,58 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     @app.patch("/v1/threads/{thread_id}/blackboard", response_model=Thread)
     def blackboard(thread_id: str, patch: dict[str, Any], agent: AgentRecord = Depends(agent_auth)) -> Thread:
         return bus.update_blackboard(agent, thread_id, patch)
+
+    # ---------------------------------------------------------------- router
+    @app.post("/v1/route/preview")
+    def route_preview(body: RoutePreview, who: AgentRecord | None = Depends(any_auth)) -> dict[str, Any]:
+        """Who the router would pick for a request, and why, without sending anything."""
+        env = EnvelopeIn(intent=Intent.request, to={"capability": body.capability}, payload=body.payload,
+                         text=body.text, prefer=body.prefer)
+        plan = bus.plan_route(who.id if who else "human", env)
+        return {"kind": plan["kind"] if plan else classify(body.capability, body.payload, body.text, None),
+                "verification": bus.router.verify, "candidates": plan["candidates"] if plan else []}
+
+    @app.get("/v1/agents/stats")
+    def agent_stats(_: Any = Depends(any_auth)) -> list[dict[str, Any]]:
+        """Each agent's track record, as the router sees it."""
+        out = []
+        for a in bus.find_agents():
+            st = bus.store.stats(a.id)
+            out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "capabilities": a.capabilities, "paused": a.paused,
+                        "cost_hint_usd": a.cost_hint_usd, **st, "reliability": round(reliability(st), 3),
+                        "load": bus.store.load(a.id), "online": bus.is_online(a)})
+        return out
+
+    # ---------------------------------------------------------------- memory
+    @app.post("/v1/memory", response_model=MemoryItem, status_code=201)
+    def remember(body: MemoryWrite, agent: AgentRecord = Depends(agent_auth)) -> MemoryItem:
+        """Create or update (by key) one of your memory items."""
+        return bus.remember(agent, body)
+
+    @app.get("/v1/memory", response_model=list[MemoryItem])
+    def list_memory(q: str | None = None, tag: str | None = None, visibility: Visibility | None = None,
+                    owner: str | None = None, thread_id: str | None = None,
+                    since: int | None = Query(None, ge=0, description="only items changed after this rev (includes tombstones)"),
+                    include_values: bool = False, max_tokens: int | None = Query(None, ge=1),
+                    limit: int = Query(50, le=500), who: AgentRecord | None = Depends(any_auth)) -> list[MemoryItem]:
+        """Memory you may read, as stubs (value=null) unless include_values=true."""
+        owner_id = bus.resolve_agent(owner).id if owner else None
+        return bus.list_memory(who, include_values=include_values, max_tokens=max_tokens, q=q, tag=tag,
+                               visibility=visibility.value if visibility else None, owner=owner_id,
+                               thread_id=thread_id, since=since, limit=limit)
+
+    @app.get("/v1/memory/{memory_id}", response_model=MemoryItem)
+    def read_memory(memory_id: str, path: str | None = Query(None, description="dotted path, e.g. findings.0"),
+                    who: AgentRecord | None = Depends(any_auth)) -> MemoryItem:
+        return bus.read_memory(who, memory_id, path)
+
+    @app.post("/v1/memory/{memory_id}/share", response_model=MemoryItem)
+    def share_memory(memory_id: str, body: MemoryShare, agent: AgentRecord = Depends(agent_auth)) -> MemoryItem:
+        return bus.share_memory(agent, memory_id, body)
+
+    @app.delete("/v1/memory/{memory_id}", response_model=MemoryStub)
+    def forget(memory_id: str, who: AgentRecord | None = Depends(any_auth)) -> MemoryStub:
+        return bus.forget(who, memory_id)
 
     # -------------------------------------------------------------- observer
     @app.get("/v1/observe/threads", response_model=list[Thread], dependencies=[Depends(observer_auth)])
@@ -221,6 +330,47 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     def obs_say(thread_id: str, body: HumanMessage) -> Envelope:
         return bus.send(None, EnvelopeIn(thread_id=thread_id, intent=body.intent, text=body.text, payload=body.payload))
 
+    @app.get("/v1/onboard/options")
+    def onboard_options() -> dict[str, Any]:
+        """Agent kinds and plain-language skills for the 'Add agent' form."""
+        return {"kinds": onboard.KINDS, "skills": {k: v["label"] for k, v in onboard.SKILLS.items()}}
+
+    @app.post("/v1/observe/onboard", dependencies=[Depends(observer_auth)])
+    def onboard_agent(body: OnboardBody, request: Request) -> dict[str, Any]:
+        """Register an agent from plain choices; returns its credentials (shown once) and setup steps."""
+        url = str(request.base_url).rstrip("/")
+        if body.kind == "a2a":
+            if not body.remote_url:
+                raise HTTPException(422, "remote_url is required for an A2A agent")
+            return {"setup": {"title": "Connect the remote A2A agent", "steps": [
+                "Run this on a machine that can reach both the messenger and the remote agent."],
+                "command": f"amsg a2a-proxy {body.remote_url} --name {onboard.slug(body.name)} --url {url}"}}
+        try:
+            priv, pub = generate_keypair()
+            c = onboard.card(body.name, body.kind, body.skills, can_review=body.can_review,
+                             cost_hint_usd=body.cost_hint_usd, description=body.description, owner=body.owner,
+                             public_key=pub)
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from e
+        agent, token = bus.register(AgentCard(**c))
+        plan = onboard.setup(body.kind, url=url, name=agent.name, token=token, private_key=priv,
+                             caps=agent.capabilities, agent_card=c)
+        public = {k: v for k, v in plan.items() if k in ("title", "steps", "command", "snippet")}
+        if "write_file" in plan:
+            public["file"] = {"path": plan["write_file"]["path"], "content": plan["write_file"]["content"]}
+            public["env"] = f"AMSG_TOKEN={token} AMSG_SIGNING_KEY={priv}"
+        return {"agent": agent, "token": token, "private_key": priv, "setup": public}
+
+    @app.post("/v1/observe/threads/{thread_id}/assign", response_model=Thread, dependencies=[Depends(observer_auth)])
+    def obs_assign(thread_id: str, body: AssignBody) -> Thread:
+        """Give a thread to a specific agent (overrides the router)."""
+        return bus.assign(thread_id, body.agent)
+
+    @app.post("/v1/observe/threads/{thread_id}/verdict", response_model=Thread, dependencies=[Depends(observer_auth)])
+    def obs_verdict(thread_id: str, body: VerdictBody) -> Thread:
+        """Approve or reject the latest result yourself (overrides any reviewer)."""
+        return bus.human_verdict(thread_id, body.verdict, body.notes)
+
     @app.post("/v1/observe/threads/{thread_id}/pause", response_model=Thread, dependencies=[Depends(observer_auth)])
     def obs_pause_thread(thread_id: str, body: PauseBody | None = None) -> Thread:
         return bus.human_pause_thread(thread_id, True, body.reason if body else None)
@@ -242,7 +392,6 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     def viewer() -> str:
         return resources.files("agentsmessenger").joinpath("viewer.html").read_text(encoding="utf-8")
 
-    from .a2a import mount_a2a
     mount_a2a(app, bus)
     return app
 

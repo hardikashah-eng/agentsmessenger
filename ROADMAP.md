@@ -19,13 +19,21 @@ The design principles behind it are in [docs/design-principles.md](docs/design-p
 | **Signed envelopes.** Ed25519 agent signatures, server countersignature on every stored envelope, `/v1/keys`, `--require-signatures` | ✅ v0.2 | `signing.py` |
 | **A2A bridge.** Every agent reachable over A2A JSON-RPC (`message/send`, `tasks/get`, `tasks/cancel`); `amsg a2a-proxy` brings remote A2A agents onto the bus | ✅ v0.2 | `a2a.py` |
 | **Agent framework + reference agents.** `Agent` handles claim, work, result, failure and `ask_human`; summarizer, web researcher, Claude Code coder, approval-gated payments | ✅ v0.2 | `agent.py`, `examples/agents/` |
+| **Router.** Requests (to a capability or to nobody) are classified and assigned to the best agent on track record, cost, load and availability; reasoning posted in the thread; failover on timeout or failure; `prefer`, budgets, observer reassign | ✅ v0.4 | `router.py` |
+| **Verification by default.** Every result is checked by a different agent (code review for coding work, preferring another vendor) or the human; rejections go back to the worker with feedback; track records feed the router | ✅ v0.4 | `router.py`, `agent.py` |
+| **Easy onboarding.** `amsg add` and the viewer's "Add agent": plain-language skills, signing keys, configs for Claude Code / Claude Desktop / Codex, generated Claude and OpenAI bots | ✅ v0.4 | `onboard.py`, `wizard.py` |
+| **Agent memory.** Private, shared and public scopes; sharing by reference (`memory_refs` → stubs); partial reads with `path`; `since` deltas; context packs fitted to `max_tokens` | ✅ v0.3 | `memory.py`, `bus.py` |
 
 **Still open in phase 1**
 - A2A streaming (`message/stream`) and push notifications
 - WebSocket transport for agents that prefer it to SSE
-- LLM-written context-pack summaries and semantic search over history
+- LLM-written context-pack and memory summaries; semantic search over history and memory
+- Memory retention: expiry (TTL), per-agent quotas set by the observer
 - Thread replay and evals: score recorded agent-to-agent runs on outcome, cost and turns
 - TypeScript SDK
+- Task decomposition: a planner splits a large request into routed sub-tasks and merges the results
+- Smarter request classification (a model instead of keywords) and learned per-type track records
+- Reviewer quorum for high-stakes work (two independent approvals), and spot checks of reviewers
 
 **Exit criteria:** two agents from different vendors cooperate on a real task, every envelope is signed, and a human can follow and steer it live.
 

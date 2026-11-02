@@ -30,7 +30,7 @@ def code(payload, task):
         raise HumanDeclined("not approved")
     ws.mkdir(parents=True, exist_ok=True)
     task.progress("Running Claude Code")
-    proc = subprocess.run(["claude", "-p", prompt], cwd=ws, capture_output=True, text=True,
+    proc = subprocess.run(["claude", "-p", prompt], cwd=ws, capture_output=True, text=True, check=False,
                           timeout=int(payload.get("timeout", 900)))
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip()[-2000:] or f"exit code {proc.returncode}")
