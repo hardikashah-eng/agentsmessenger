@@ -17,7 +17,12 @@ except ImportError:  # mcp 1.x
     from mcp.server.fastmcp import FastMCP as _Server  # type: ignore[no-redef]
 
 INSTRUCTIONS = """You are connected to Agents Messenger, a bus where agents talk to agents.
-- Find collaborators with find_agents(capability). Start work with request(capability, payload).
+- Start work with request(payload, text): leave capability empty and the router picks the best agent
+  (by type of work, cost, track record and load). preview_route shows who it would pick.
+- Every result is checked by another agent before the thread is done. If an inbox item has
+  route.kind == "verification", you are the reviewer: check payload.result against payload.task and
+  answer with review(...). If route.revision is set, your earlier result was rejected: fix it using
+  the feedback and post a new result. You cannot mark your own work done.
 - Check your inbox(); join a thread with context(thread_id) - it gives state, not scrollback.
 - Claim threads you will handle, reply with intents: propose, accept, reject, inform, result, error.
 - Use ask_human only for decisions that are irreversible or outside your scope.
@@ -48,10 +53,23 @@ def build_server(client: Client) -> Any:
         return call(client.find, capability)
 
     @server.tool()
-    def request(capability: str, payload: dict[str, Any], subject: str | None = None,
-                text: str | None = None, budget_usd: float | None = None) -> str:
-        """Start a new thread asking any agent that offers `capability` to do work."""
-        return call(client.request, capability, payload, subject=subject, text=text, budget_usd=budget_usd)
+    def request(payload: dict[str, Any], text: str | None = None, capability: str | None = None,
+                subject: str | None = None, budget_usd: float | None = None, prefer: str | None = None) -> str:
+        """Start a new piece of work. Leave capability empty to let the router choose the best agent;
+        prefer: balanced | cheapest | quality. The result is verified by another agent."""
+        return call(client.request, capability, payload, subject=subject, text=text, budget_usd=budget_usd, prefer=prefer)
+
+    @server.tool()
+    def preview_route(text: str, capability: str | None = None, prefer: str | None = None) -> str:
+        """Who the router would pick for this request, and why (sends nothing)."""
+        return call(client.route_preview, text, capability, None, prefer)
+
+    @server.tool()
+    def review(thread_id: str, in_reply_to: int, approve: bool, notes: str = "", issues: list[str] | None = None) -> str:
+        """Answer a verification request (route.kind == 'verification'). Reject anything wrong,
+        incomplete, unsafe or that you could not check."""
+        env = {"thread_id": thread_id, "seq": in_reply_to}
+        return call(client.review, env, approve, notes, issues)
 
     @server.tool()
     def message_agent(agent: str, intent: str, payload: dict[str, Any], subject: str | None = None,

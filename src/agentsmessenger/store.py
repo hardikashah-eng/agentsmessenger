@@ -69,7 +69,20 @@ CREATE TABLE IF NOT EXISTS memory_grants (
   PRIMARY KEY (memory_id, kind, target)
 );
 CREATE INDEX IF NOT EXISTS ix_grants_target ON memory_grants(kind, target);
+CREATE TABLE IF NOT EXISTS agent_stats (
+  agent_id TEXT PRIMARY KEY,
+  assigned INTEGER NOT NULL DEFAULT 0,
+  approved INTEGER NOT NULL DEFAULT 0,
+  rejected INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  timeouts INTEGER NOT NULL DEFAULT 0,
+  reviews INTEGER NOT NULL DEFAULT 0,
+  cost_usd REAL NOT NULL DEFAULT 0
+);
 """
+
+STAT_FIELDS = ("assigned", "approved", "rejected", "failed", "timeouts", "reviews", "cost_usd")
+ACTIVE_STATES = ("claimed", "working", "verifying")
 
 
 def _hash(token: str) -> str:
@@ -280,6 +293,10 @@ class Store:
         ).fetchall()
         return [self._env(r) for r in rows]
 
+    def get_message(self, seq: int) -> Envelope | None:
+        r = self._db.execute("SELECT seq, data FROM messages WHERE seq=?", (seq,)).fetchone()
+        return self._env(r) if r else None
+
     def last_messages(self, thread_id: str, n: int) -> list[Envelope]:
         rows = self._db.execute(
             "SELECT seq, data FROM messages WHERE thread_id=? ORDER BY seq DESC LIMIT ?", (thread_id, n)
@@ -309,7 +326,8 @@ class Store:
             # Capability broadcasts stop going to others once someone else owns the thread.
             if env.to.capability and env.to.agent is None:
                 t = self.get_thread(env.thread_id)
-                if t and t.owner and t.owner != agent_id and agent_id not in t.participants:
+                taken_by = t.owner or t.assigned_to if t else None
+                if t and taken_by and taken_by != agent_id and agent_id not in t.participants:
                     continue
             out.append(env)
         return out
@@ -395,3 +413,35 @@ class Store:
     def is_participant(self, thread_id: str, agent_id: str) -> bool:
         return self._db.execute("SELECT 1 FROM participants WHERE thread_id=? AND agent_id=?",
                                 (thread_id, agent_id)).fetchone() is not None
+
+    # -------------------------------------------------------- agent stats
+    def bump_stats(self, agent_id: str, **deltas: float) -> None:
+        """Add to an agent's track record (used by the router)."""
+        bad = set(deltas) - set(STAT_FIELDS)
+        if bad:
+            raise ValueError(f"unknown stats: {bad}")
+        sets = ", ".join(f"{k} = {k} + ?" for k in deltas)
+        with self._lock, self._db:
+            self._db.execute("INSERT OR IGNORE INTO agent_stats(agent_id) VALUES (?)", (agent_id,))
+            self._db.execute(f"UPDATE agent_stats SET {sets} WHERE agent_id = ?", [*deltas.values(), agent_id])
+
+    def stats(self, agent_id: str) -> dict[str, float]:
+        r = self._db.execute("SELECT * FROM agent_stats WHERE agent_id=?", (agent_id,)).fetchone()
+        return {k: (r[k] if r else 0) for k in STAT_FIELDS}
+
+    def load(self, agent_id: str) -> int:
+        """Threads this agent is assigned to or working on right now."""
+        r = self._db.execute(
+            "SELECT COUNT(*) FROM threads WHERE json_extract(data, '$.state') IN (?,?,?,?) AND "
+            "(json_extract(data, '$.owner') = ? OR (json_extract(data, '$.assigned_to') = ? "
+            " AND json_extract(data, '$.owner') IS NULL))",
+            ("open", *ACTIVE_STATES, agent_id, agent_id),
+        ).fetchone()
+        return int(r[0])
+
+    def threads_in_states(self, states: Iterable[str], limit: int = 500) -> list[Thread]:
+        states = list(states)
+        rows = self._db.execute(
+            f"SELECT data FROM threads WHERE json_extract(data, '$.state') IN ({','.join('?' * len(states))}) "
+            "ORDER BY updated_at LIMIT ?", [*states, limit]).fetchall()
+        return [Thread.model_validate_json(r[0]) for r in rows]

@@ -36,6 +36,7 @@ class ThreadState(str, Enum):
     claimed = "claimed"
     working = "working"
     waiting_human = "waiting_human"
+    verifying = "verifying"          # a result is being checked by another agent (or the human)
     paused = "paused"
     done = "done"
     failed = "failed"
@@ -46,10 +47,15 @@ TERMINAL = {ThreadState.done, ThreadState.failed}
 # Allowed state transitions. Humans may additionally pause/resume any thread.
 TRANSITIONS: dict[ThreadState, set[ThreadState]] = {
     ThreadState.open: {ThreadState.claimed, ThreadState.failed, ThreadState.waiting_human, ThreadState.paused},
-    ThreadState.claimed: {ThreadState.working, ThreadState.open, ThreadState.failed, ThreadState.waiting_human, ThreadState.paused},
-    ThreadState.working: {ThreadState.done, ThreadState.failed, ThreadState.waiting_human, ThreadState.paused},
-    ThreadState.waiting_human: {ThreadState.working, ThreadState.open, ThreadState.failed, ThreadState.paused},
-    ThreadState.paused: {ThreadState.open, ThreadState.claimed, ThreadState.working, ThreadState.failed},
+    ThreadState.claimed: {ThreadState.working, ThreadState.open, ThreadState.failed, ThreadState.waiting_human,
+                          ThreadState.paused, ThreadState.verifying, ThreadState.done},
+    ThreadState.working: {ThreadState.done, ThreadState.failed, ThreadState.waiting_human, ThreadState.paused,
+                          ThreadState.verifying, ThreadState.open},
+    ThreadState.waiting_human: {ThreadState.working, ThreadState.open, ThreadState.failed, ThreadState.paused,
+                                ThreadState.verifying, ThreadState.done},
+    ThreadState.verifying: {ThreadState.done, ThreadState.working, ThreadState.waiting_human, ThreadState.failed,
+                            ThreadState.paused, ThreadState.open},
+    ThreadState.paused: {ThreadState.open, ThreadState.claimed, ThreadState.working, ThreadState.failed, ThreadState.verifying},
     ThreadState.done: set(),
     ThreadState.failed: set(),
 }
@@ -115,13 +121,15 @@ class EnvelopeIn(BaseModel):
     cost_usd: float = Field(0.0, ge=0, description="what producing this message cost the sender")
     budget_usd: float | None = Field(None, ge=0, description="budget for a new thread")
     deadline: datetime | None = None
+    prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality)$",
+                               description="routing preference for a new request: balanced (default), cheapest or quality")
     idempotency_key: str | None = Field(None, max_length=128)
     signature: str | None = Field(None, description="Ed25519 signature over the canonical envelope (see signing.py)")
 
     @model_validator(mode="after")
     def _routing(self) -> "EnvelopeIn":
-        if self.thread_id is None and not (self.to.agent or self.to.capability):
-            raise ValueError("a new thread needs a recipient agent or capability")
+        if self.thread_id is None and not (self.to.agent or self.to.capability) and self.intent != Intent.request:
+            raise ValueError("a new thread needs a recipient agent or capability (only requests can be auto-routed)")
         return self
 
 
@@ -150,6 +158,10 @@ class Thread(BaseModel):
     message_count: int = 0
     blackboard: dict[str, Any] = Field(default_factory=dict)
     pause_reason: str | None = None
+    kind: str | None = Field(None, description="request type the router classified: code, research, writing, ...")
+    assigned_to: str | None = Field(None, description="agent the router assigned; only it may claim")
+    routing: dict[str, Any] = Field(default_factory=dict, description="router decision, candidates and attempts")
+    verification: dict[str, Any] = Field(default_factory=dict, description="who checks the result, and the verdicts")
     created_at: datetime
     updated_at: datetime
     deadline: datetime | None = None
@@ -167,6 +179,8 @@ class Delivery(BaseModel):
     notice: str | None = None
     memory: list["MemoryStub"] = Field(default_factory=list, description="stubs for envelope.memory_refs the reader may open")
     clipped: bool = Field(False, description="payload/text replaced by a stub to fit a token budget; fetch the thread messages for the full envelope")
+    route: dict[str, Any] | None = Field(None, description="set on requests the router sent you: capability, kind "
+                                         "('work' | 'verification'), and revision feedback when your result was rejected")
 
 
 class ContextPack(BaseModel):

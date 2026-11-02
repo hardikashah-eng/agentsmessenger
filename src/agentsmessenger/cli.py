@@ -21,6 +21,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--port", type=int, default=8765)
     s.add_argument("--open-registration", action="store_true", help="let agents register without the observer token")
     s.add_argument("--require-signatures", action="store_true", help="every agent must register a key and sign envelopes")
+    s.add_argument("--no-routing", action="store_true", help="broadcast capability requests instead of assigning one agent")
+    s.add_argument("--no-verification", action="store_true", help="don't have another agent check results (not recommended)")
+    s.add_argument("--strategy", choices=["balanced", "cheapest", "quality"], default="balanced", help="default routing preference")
+    s.add_argument("--claim-timeout", type=float, default=90, help="seconds before unclaimed work goes to the next agent")
+    s.add_argument("--review-timeout", type=float, default=300, help="seconds before an unanswered review goes to another reviewer")
+    s.add_argument("--no-human-review", action="store_true",
+                   help="when no reviewer agent exists, close without review instead of asking the human")
     s.add_argument("--server-key", default=os.environ.get("AMSG_SERVER_KEY_FILE", "amsg-server.key"),
                    help="file holding the server's Ed25519 key (created if missing)")
 
@@ -44,6 +51,20 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--url", default=os.environ.get("AMSG_URL", "http://127.0.0.1:8765"))
     r.add_argument("--observer-token", default=os.environ.get("AMSG_OBSERVER_TOKEN"))
 
+    ad = sub.add_parser("add", help="add an agent in a few questions (Claude Code, Claude Desktop, Codex, API bots, A2A)")
+    ad.add_argument("--kind", choices=["claude-code", "claude-desktop", "codex", "claude-bot", "openai-bot", "a2a"])
+    ad.add_argument("--name")
+    ad.add_argument("--skill", action="append", help="coding, code-review, research, writing, summarizing, data, "
+                                                      "checking, general (repeatable)")
+    ad.add_argument("--review", dest="review", action="store_true", default=None, help="let it check other agents' work")
+    ad.add_argument("--no-review", dest="review", action="store_false")
+    ad.add_argument("--cost", type=float, help="typical cost per request in USD (helps the router)")
+    ad.add_argument("--remote", help="for --kind a2a: the remote agent's URL")
+    ad.add_argument("--yes", action="store_true", help="write config files / run setup without asking")
+    ad.add_argument("--print-only", action="store_true", help="only show the setup; don't change any files")
+    ad.add_argument("--url", default=os.environ.get("AMSG_URL", "http://127.0.0.1:8765"))
+    ad.add_argument("--observer-token", default=os.environ.get("AMSG_OBSERVER_TOKEN"))
+
     m = sub.add_parser("mcp", help="run the MCP adapter (stdio) for one agent")
     m.add_argument("--url", default=os.environ.get("AMSG_URL", "http://127.0.0.1:8765"))
     m.add_argument("--token", default=os.environ.get("AMSG_TOKEN"))
@@ -57,12 +78,17 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         from .bus import Bus
+        from .router import RouterConfig
         from .server import create_app
         from .signing import ServerSigner
         from .store import Store
 
         token = os.environ.get("AMSG_OBSERVER_TOKEN") or ("obs_" + secrets.token_urlsafe(24))
-        bus = Bus(Store(a.db), signer=ServerSigner(key_file=a.server_key), require_signatures=a.require_signatures)
+        router = RouterConfig(enabled=not a.no_routing, verify=not a.no_verification, strategy=a.strategy,
+                              claim_timeout_s=a.claim_timeout, verify_timeout_s=a.review_timeout,
+                              human_fallback=not a.no_human_review)
+        bus = Bus(Store(a.db), signer=ServerSigner(key_file=a.server_key), require_signatures=a.require_signatures,
+                  router=router)
         app = create_app(bus, observer_token=token, open_registration=a.open_registration or None)
         print(f"Agents Messenger on http://{a.host}:{a.port}", file=sys.stderr)
         if not os.environ.get("AMSG_OBSERVER_TOKEN"):
@@ -111,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{name}] proxying {a.remote} skills={caps}", file=sys.stderr)
         A2AProxy(c, remote).run()
         return 0
+
+    if a.cmd == "add":
+        from .wizard import run_add
+        return run_add(a)
 
     if a.cmd == "mcp":
         if not a.token:

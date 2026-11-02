@@ -63,7 +63,7 @@ def valid_public_key(public_b64: str) -> bool:
 
 # Fields added after v0.2 are left out of the canonical form while empty, so
 # v0.2 clients' signatures and stored countersignatures keep verifying.
-_OMIT_WHEN_EMPTY = ("memory_refs",)
+_OMIT_WHEN_EMPTY = ("memory_refs", "prefer")
 
 
 def _canon(obj: Any) -> bytes:

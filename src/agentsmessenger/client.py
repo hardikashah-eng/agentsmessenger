@@ -63,21 +63,41 @@ class Client:
              thread_id: str | None = None, payload: dict[str, Any] | None = None, text: str | None = None,
              subject: str | None = None, in_reply_to: int | None = None, cost_usd: float = 0.0,
              budget_usd: float | None = None, idempotency_key: str | None = None,
-             artifacts: list[str] | None = None, memory_refs: list[str] | None = None) -> dict[str, Any]:
+             artifacts: list[str] | None = None, memory_refs: list[str] | None = None,
+             prefer: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "intent": intent, "to": {"agent": to_agent, "capability": to_capability},
             "thread_id": thread_id, "payload": payload or {}, "text": text, "subject": subject,
             "in_reply_to": in_reply_to, "cost_usd": cost_usd, "budget_usd": budget_usd,
             "idempotency_key": idempotency_key, "artifacts": artifacts or [], "memory_refs": memory_refs or None,
+            "prefer": prefer,
         }
         body = {k: v for k, v in body.items() if v is not None}
         if self.signing_key:
             body["signature"] = sign(body, self.signing_key)
         return self._req("POST", "/v1/messages", json=body)
 
-    def request(self, capability: str, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
-        """Start a thread asking whoever offers `capability`."""
+    def request(self, capability: str | None, payload: dict[str, Any], **kw: Any) -> dict[str, Any]:
+        """Start a thread asking whoever offers `capability`. With capability=None the
+        router works out what kind of request it is and picks the best agent."""
         return self.send("request", to_capability=capability, payload=payload, **kw)
+
+    def ask(self, text: str, payload: dict[str, Any] | None = None, prefer: str | None = None, **kw: Any) -> dict[str, Any]:
+        """Plain-language request; the router picks who does it (prefer: balanced | cheapest | quality)."""
+        return self.send("request", payload=payload or {}, text=text, subject=kw.pop("subject", text[:120]),
+                         prefer=prefer, **kw)
+
+    def route_preview(self, text: str | None = None, capability: str | None = None, payload: dict[str, Any] | None = None,
+                      prefer: str | None = None) -> dict[str, Any]:
+        """Who the router would pick for this request, and why, without sending it."""
+        body = {"text": text, "capability": capability, "payload": payload or {}, "prefer": prefer}
+        return self._req("POST", "/v1/route/preview", json=body)
+
+    def review(self, envelope: dict[str, Any], approve: bool, notes: str = "", issues: list[Any] | None = None) -> dict[str, Any]:
+        """Answer a verification request."""
+        return self.reply(envelope, "result", {"verdict": "approve" if approve else "reject", "notes": notes,
+                                               "issues": issues or []}, text=("Approved" if approve else "Rejected") +
+                          (f": {notes}" if notes else ""))
 
     def reply(self, envelope: dict[str, Any], intent: str, payload: dict[str, Any] | None = None, **kw: Any) -> dict[str, Any]:
         return self.send(intent, thread_id=envelope["thread_id"], in_reply_to=envelope["seq"], payload=payload, **kw)

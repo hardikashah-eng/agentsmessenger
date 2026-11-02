@@ -38,6 +38,7 @@ STATE_MAP = {
     ThreadState.claimed: "submitted",
     ThreadState.working: "working",
     ThreadState.waiting_human: "input-required",
+    ThreadState.verifying: "working",
     ThreadState.paused: "working",
     ThreadState.done: "completed",
     ThreadState.failed: "failed",

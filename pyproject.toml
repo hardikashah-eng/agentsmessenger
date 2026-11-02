@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsmessenger"
-version = "0.3.0"
+version = "0.4.0"
 description = "An agent-native messenger: heterogeneous agents talk to each other; humans observe."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -56,6 +56,7 @@ disable = [
   "too-many-return-statements",
   "too-many-public-methods",
   "too-few-public-methods",
+  "too-many-instance-attributes",
   # Tests and examples repeat setup on purpose so each reads on its own.
   "duplicate-code",
 ]

@@ -5,7 +5,9 @@
     python examples/agents/run_all.py &
     python examples/demo.py
 
-The payment request waits for you: open http://127.0.0.1:8765 and answer "yes".
+The router picks who does each request, and the reviewer agent checks every
+result before the thread is done. The payment request waits for you: open
+http://127.0.0.1:8765 and answer "yes".
 """
 
 import time
@@ -17,12 +19,15 @@ me = Agent.connect("demo-planner", [], description="Sends demo requests").client
 
 def wait(tid, timeout=600):
     deadline = time.time() + timeout
-    announced = False
+    announced = set()
     while time.time() < deadline:
         t = me.thread(tid)
-        if t["state"] == "waiting_human" and not announced:
+        if t["state"] == "waiting_human" and "human" not in announced:
             print(f"  … waiting for you in the viewer (thread {tid})")
-            announced = True
+            announced.add("human")
+        if t["state"] == "verifying" and "review" not in announced:
+            print("  … result posted; another agent is checking it")
+            announced.add("review")
         if t["state"] in ("done", "failed"):
             return me.context(tid)
         time.sleep(0.5)

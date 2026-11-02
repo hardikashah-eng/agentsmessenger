@@ -10,22 +10,22 @@ from typing import Any
 from .guards import GuardConfig, GuardError, Guards, Forbidden, NotFound, UNTRUSTED_NOTICE, injection_flags
 from .memory import MemoryMixin
 from .models import (
-    AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
+    Address, AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
     Thread, ThreadState, TRANSITIONS, TERMINAL, estimate_tokens,
 )
+from .router import HUMAN, SYSTEM, RouterConfig, RouterMixin
 from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
 
-__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM"]
-
-HUMAN = "human"
-SYSTEM = "system"
+__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM", "RouterConfig"]
 
 
-class Bus(MemoryMixin):
+class Bus(MemoryMixin, RouterMixin):
     def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None,
-                 signer: ServerSigner | None = None, require_signatures: bool = False) -> None:
+                 signer: ServerSigner | None = None, require_signatures: bool = False,
+                 router: RouterConfig | None = None) -> None:
         self.store = store or Store()
+        self.router = router or RouterConfig()
         self.guards = Guards(guard_config)
         self.signer = signer or ServerSigner()
         self.require_signatures = require_signatures
@@ -113,6 +113,10 @@ class Bus(MemoryMixin):
         elif thread is not None and thread.state in TERMINAL:
             raise GuardError("thread_closed", f"thread is {thread.state.value}")
 
+        plan = None
+        if thread is None and env.intent == Intent.request and not env.to.agent:
+            plan = self.plan_route(sender_id, env)
+
         if thread is None:
             subject = env.subject or (env.text or env.intent.value)[:120]
             budget = env.budget_usd if env.budget_usd is not None else self.guards.config.default_thread_budget_usd
@@ -123,7 +127,7 @@ class Bus(MemoryMixin):
 
         stored = self.store.append(env, thread_id=thread.id, sender=sender_id, sender_kind=kind,
                                    verified=verified, signer=self.signer,
-                                   to_agent_id=to_agent.id if to_agent else None)
+                                   to_agent_id=to_agent.id if to_agent else plan["candidates"][0]["agent"] if plan else None)
 
         thread = self._thread(thread.id)
         thread.message_count += 1
@@ -135,6 +139,10 @@ class Bus(MemoryMixin):
             self.store.add_participant(thread, to_agent.id)
         if stored.memory_refs:
             self.grant_refs_to_thread(sender.id if sender else None, stored)
+        if plan:
+            self.apply_route(self._thread(thread.id), stored, plan)
+        if sender and env.cost_usd:
+            self.store.bump_stats(sender.id, cost_usd=env.cost_usd)
         thread = self._thread(thread.id)
 
         if env.intent == Intent.ask_human:
@@ -142,14 +150,32 @@ class Bus(MemoryMixin):
         elif sender is None and thread.state == ThreadState.waiting_human:
             thread.state = ThreadState.working if thread.owner else ThreadState.open
         self.store.save_thread(thread)
+        self._after_send(sender, self._thread(thread.id), stored)
 
+        thread = self._thread(thread.id)
         reason = self.guards.detect_loop(self.store.last_messages(thread.id, self.guards.config.loop_window))
         if reason and thread.state not in TERMINAL:
             self._pause_thread(thread, reason)
         return stored
 
+    def _after_send(self, sender: AgentRecord | None, t: Thread, stored: Envelope) -> None:
+        """Verification hooks: verdicts from the reviewer, new results from the worker, human answers."""
+        v = t.verification
+        if sender is not None:
+            if v.get("status") == "pending" and v.get("verifier") == sender.id:
+                self.on_verifier_message(t, sender, stored)
+            elif stored.intent == Intent.result:
+                self.maybe_verify(sender, t, stored)
+        elif t.state == ThreadState.verifying and v.get("verifier") == HUMAN and v.get("status") == "pending":
+            verdict = self.parse_verdict(stored)
+            if verdict:
+                notes = (stored.text or "").split(":", 1)[1].strip() if ":" in (stored.text or "") else ""
+                self.apply_verdict(t, HUMAN, verdict, notes)
+
     def _can_join(self, agent: AgentRecord, t: Thread) -> bool:
-        # Agents offering the routed capability may join an unclaimed thread.
+        # Agents offering the routed capability may join an unclaimed thread, unless the router assigned it.
+        if t.assigned_to and t.assigned_to != agent.id:
+            return False
         return bool(t.capability and t.capability in agent.capabilities and t.owner is None)
 
     # -------------------------------------------------------------- threads
@@ -170,6 +196,9 @@ class Bus(MemoryMixin):
             return t
         if t.state != ThreadState.open or t.owner:
             raise GuardError("already_claimed", f"thread is {t.state.value}" + (f", owned by {t.owner}" if t.owner else ""))
+        if t.assigned_to and t.assigned_to != agent.id:
+            owner = self.store.get_agent(t.assigned_to)
+            raise Forbidden(f"the router assigned this thread to {owner.name if owner else t.assigned_to}")
         if t.capability and t.capability not in agent.capabilities and agent.id not in t.participants:
             raise Forbidden(f"agent does not offer {t.capability!r}")
         t.owner = agent.id
@@ -185,6 +214,26 @@ class Bus(MemoryMixin):
             raise Forbidden("only the thread's owner or creator can change its state")
         if agent is not None and state == ThreadState.paused:
             raise Forbidden("only the human observer can pause a thread")
+        if state == t.state:
+            return t
+        if state == ThreadState.verifying and agent is not None:
+            raise Forbidden("verification starts when you post a result")
+        if state == ThreadState.done:
+            if agent is not None and self.router.verify and \
+                    t.verification.get("status") not in ("approved", "overridden", "skipped"):
+                return self._done_needs_review(agent, t)
+            if agent is None and t.verification.get("status") == "pending":
+                t.verification["status"] = "overridden"
+            if agent is not None and agent.id == t.owner and not self.router.verify:
+                self.store.bump_stats(agent.id, approved=1)
+        if state == ThreadState.failed and agent is not None and agent.id == t.owner and t.routing.get("request_seq"):
+            self.store.bump_stats(agent.id, failed=1)
+            if self.router.enabled and t.state not in TERMINAL:
+                # Next capable agent; with none left the thread fails as usual.
+                moved = self.reroute(t, f"{agent.name} failed" + (f": {reason}" if reason else ""), on_failure=True)
+                if moved is not None:
+                    return moved
+                t = self._thread(thread_id)
         if state not in TRANSITIONS[t.state] and not (agent is None and t.state not in TERMINAL):
             raise GuardError("bad_transition", f"cannot go from {t.state.value} to {state.value}")
         t.state = state
@@ -195,6 +244,16 @@ class Bus(MemoryMixin):
         who = agent.name if agent else HUMAN
         self._system(t.id, {"event": "state", "state": state.value, "by": who, "reason": reason},
                      f"{who} set state to {state.value}" + (f": {reason}" if reason else ""))
+        return self._thread(t.id)
+
+    def _done_needs_review(self, agent: AgentRecord, t: Thread) -> Thread:
+        """An agent can't close its own work: 'done' means 'verified'."""
+        if t.state == ThreadState.verifying:
+            return t
+        mine = [m for m in self.store.thread_messages(t.id, 0, 10_000) if m.intent == Intent.result and m.sender == agent.id]
+        if not mine:
+            raise GuardError("result_required", "post a result first; it is verified before the thread is done", 409)
+        self.maybe_verify(agent, t, mine[-1])
         return self._thread(t.id)
 
     def update_blackboard(self, agent: AgentRecord, thread_id: str, patch: dict[str, Any]) -> Thread:
@@ -214,9 +273,16 @@ class Bus(MemoryMixin):
         self.store.save_thread(t)
         self._system(t.id, {"event": "paused", "reason": reason}, f"Thread paused: {reason}")
 
-    def _system(self, thread_id: str, payload: dict[str, Any], text: str) -> Envelope:
-        env = EnvelopeIn(thread_id=thread_id, intent=Intent.inform, payload=payload, text=text)
-        return self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system", signer=self.signer)
+    def _system(self, thread_id: str, payload: dict[str, Any], text: str, *, intent: Intent = Intent.inform,
+                to: str | None = None, artifacts: list[str] | None = None, memory_refs: list[str] | None = None) -> Envelope:
+        env = EnvelopeIn(thread_id=thread_id, intent=intent, payload=payload, text=text, to=Address(agent=to),
+                         artifacts=artifacts or [], memory_refs=memory_refs or [])
+        stored = self.store.append(env, thread_id=thread_id, sender=SYSTEM, sender_kind="system", signer=self.signer,
+                                   to_agent_id=to)
+        t = self._thread(thread_id)
+        t.message_count += 1
+        self.store.save_thread(t)
+        return stored
 
     # ------------------------------------------------------------- reading
     def deliver(self, reader_id: str, env: Envelope) -> Delivery:
@@ -227,7 +293,8 @@ class Bus(MemoryMixin):
             notice = UNTRUSTED_NOTICE + (f" Flagged phrases: {', '.join(flags)}." if flags else "")
         rid = None if reader_id == HUMAN else reader_id
         memory = self.memory_stubs_for(rid, env.memory_refs) if env.memory_refs else []
-        return Delivery(envelope=env, untrusted=untrusted, notice=notice, memory=memory)
+        route = self.route_for(reader_id, env) if env.intent == Intent.request else None
+        return Delivery(envelope=env, untrusted=untrusted, notice=notice, memory=memory, route=route)
 
     def inbox(self, agent: AgentRecord, after: int = 0, limit: int = 100) -> list[Delivery]:
         return [self.deliver(agent.id, e) for e in self.store.inbox(agent.id, after, limit)]
@@ -247,7 +314,10 @@ class Bus(MemoryMixin):
         msgs = self.store.thread_messages(thread_id, 0, 10_000)
         answered = {m.in_reply_to for m in msgs if m.intent in (Intent.result, Intent.reject, Intent.error) and m.in_reply_to}
         open_requests = [m for m in msgs if m.intent == Intent.request and m.seq not in answered]
-        results = [m for m in msgs if m.intent == Intent.result][-3:]
+        # Reviewers' verdicts live in t.verification; results here are the work itself.
+        review_reqs = {int(k) for k, m in (t.routing.get("messages") or {}).items() if m.get("kind") == "verification"}
+        work = [m for m in msgs if m.intent == Intent.result and m.in_reply_to not in review_reqs]
+        results = work[-3:]
         names = {a.id: a.name for a in self.store.list_agents()}
         names.update({HUMAN: HUMAN, SYSTEM: SYSTEM})
         budget = f"${t.spent_usd:.3f} of ${t.budget_usd:.2f}" if t.budget_usd is not None else f"${t.spent_usd:.2f} (no budget)"
@@ -256,10 +326,17 @@ class Bus(MemoryMixin):
             + (f", owned by {names.get(t.owner, t.owner)}" if t.owner else ", unclaimed")
             + f". {t.message_count} messages; spent {budget}.",
             "Participants: " + ", ".join(names.get(p, p) for p in t.participants) + ".",
-            f"Open requests: {len(open_requests)}. Results so far: {len([m for m in msgs if m.intent == Intent.result])}.",
+            f"Open requests: {len(open_requests)}. Results so far: {len(work)}.",
         ]
         if t.pause_reason:
             lines.append(f"Paused because: {t.pause_reason}.")
+        if t.assigned_to and not t.owner:
+            lines.append(f"Router assigned it to {names.get(t.assigned_to, t.assigned_to)} ({t.kind or 'request'}).")
+        v = t.verification
+        if v.get("status") == "pending":
+            lines.append(f"Waiting for verification by {names.get(v.get('verifier'), v.get('verifier'))}.")
+        elif v.get("status") in ("approved", "rejected", "overridden"):
+            lines.append(f"Verification: {v['status']} after {len(v.get('history', []))} review(s).")
         if t.blackboard:
             lines.append("Blackboard keys: " + ", ".join(sorted(t.blackboard)) + ".")
         rid = reader.id if reader else HUMAN

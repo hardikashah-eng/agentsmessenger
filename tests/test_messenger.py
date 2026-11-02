@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 from agentsmessenger import Bus, Client, GuardConfig, MessengerError, Store
+from agentsmessenger.router import RouterConfig
 from agentsmessenger.server import create_app
 
 OBS = "obs_test"
@@ -12,8 +13,8 @@ OBS = "obs_test"
 
 @pytest.fixture
 def make():
-    def _make(**guard):
-        app = create_app(Bus(Store(), GuardConfig(**guard)), observer_token=OBS)
+    def _make(router=None, **guard):
+        app = create_app(Bus(Store(), GuardConfig(**guard), router=router), observer_token=OBS)
         http = TestClient(app)
 
         def agent(name, caps=(), vendor="test"):
@@ -26,8 +27,9 @@ def make():
     return _make
 
 
-def test_capability_request_claim_result(make):
-    agent, _obs, _ = make()
+def test_capability_broadcast_without_router(make):
+    """With routing and verification turned off, capability requests are broadcast and the first claim wins."""
+    agent, _obs, _ = make(router=RouterConfig(enabled=False, verify=False))
     planner = agent("planner", vendor="anthropic")
     worker = agent("pdf-worker", ["pdf.extract"], vendor="openai")
     other = agent("pdf-backup", ["pdf.extract"], vendor="local")
