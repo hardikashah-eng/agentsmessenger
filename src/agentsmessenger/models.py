@@ -73,6 +73,8 @@ class AgentCard(BaseModel):
     cost_hint_usd: float | None = Field(None, ge=0, description="typical cost per request")
     public_key: str | None = Field(None, description="Ed25519 public key (base64url, raw 32 bytes); if set, every send must be signed")
     a2a_url: str | None = Field(None, description="for proxy agents: the remote A2A endpoint they forward to")
+    eta_hint_s: float | None = Field(None, ge=0, description="typical wall-clock seconds per request (instant awards)")
+    tokens_hint: int | None = Field(None, ge=0, description="typical tokens per request (instant awards)")
     rates: dict[str, float] = Field(default_factory=dict,
                                     description="rate card: price in USD per request, by capability or type of work "
                                                 "(e.g. {'code.task': 0.02, 'writing': 0.01}); used for instant awards and auto-bids")
@@ -122,6 +124,7 @@ class EnvelopeIn(BaseModel):
     in_reply_to: int | None = None
     on_behalf_of: str | None = None
     cost_usd: float = Field(0.0, ge=0, description="what producing this message cost the sender")
+    tokens_used: int | None = Field(None, ge=0, description="model tokens the sender used to produce this message")
     budget_usd: float | None = Field(None, ge=0, description="budget for a new thread")
     deadline: datetime | None = None
     prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality)$",

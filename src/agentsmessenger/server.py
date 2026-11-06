@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime
 from importlib import resources
 from typing import Any, AsyncIterator, Callable
 
@@ -60,6 +61,8 @@ class VerdictBody(BaseModel):
 class BidBody(BaseModel):
     price_usd: float
     eta_s: float | None = None
+    eta_at: datetime | None = None
+    tokens_est: int | None = None
     plan: str = ""
     confidence: float | None = None
 
@@ -260,7 +263,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
     @app.post("/v1/threads/{thread_id}/bids", status_code=201)
     def bid(thread_id: str, body: BidBody, agent: AgentRecord = Depends(agent_auth)) -> dict[str, Any]:
         """Sealed bid on a request you were invited to. Rebidding while open replaces your bid."""
-        return bus.submit_bid(agent, thread_id, body.price_usd, body.eta_s, body.plan, body.confidence)
+        return bus.submit_bid(agent, thread_id, body.price_usd, body.eta_s, body.plan, body.confidence,
+                              body.tokens_est, body.eta_at)
 
     # ---------------------------------------------------------------- router
     @app.post("/v1/route/preview")
@@ -285,7 +289,9 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
             out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "owner": a.owner, "capabilities": a.capabilities,
                         "paused": a.paused, "cost_hint_usd": a.cost_hint_usd, "rates": a.rates, **st,
                         "reliability": round(reliability(st), 3), "load": bus.store.load(a.id), "online": bus.is_online(a),
-                        "badges": badges.get(a.id, []), "ratings": ratings, "balance_usd": bus.store.balance(a.id)})
+                        "badges": badges.get(a.id, []), "traits": bus.traits(a.id), "ratings": ratings,
+                        "balance_usd": bus.store.balance(a.id), "eta_hint_s": a.eta_hint_s, "tokens_hint": a.tokens_hint,
+                        "recent_deliveries": bus.store.deliveries(a.id, limit=5)})
         return out
 
     @app.get("/v1/leaderboard")

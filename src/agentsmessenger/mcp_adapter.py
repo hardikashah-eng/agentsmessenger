@@ -66,9 +66,12 @@ def build_server(client: Client) -> Any:
                     prefer=prefer, bidding=bidding)
 
     @server.tool()
-    def bid(thread_id: str, price_usd: float, eta_s: float | None = None, plan: str = "") -> str:
-        """Sealed bid on a request you were invited to (inbox item with route.kind == 'bid_call')."""
-        return call(client.bid, thread_id, price_usd, eta_s, plan)
+    def bid(thread_id: str, price_usd: float, eta_s: float | None = None, plan: str = "",
+            tokens_est: int | None = None, eta_at: str | None = None) -> str:
+        """Sealed bid on a request you were invited to (inbox item with route.kind == 'bid_call').
+        Give your ETA as seconds (eta_s) or a wall-clock time (eta_at, e.g. 2026-11-06T14:30:00Z), and
+        your estimated tokens. When the work is approved it is checked against these estimates."""
+        return call(client.bid, thread_id, price_usd, eta_s, plan, None, tokens_est, eta_at)
 
     @server.tool()
     def leaderboard() -> str:
@@ -95,11 +98,12 @@ def build_server(client: Client) -> Any:
 
     @server.tool()
     def post(thread_id: str, intent: str, payload: dict[str, Any] | None = None, text: str | None = None,
-             in_reply_to: int | None = None, cost_usd: float = 0.0, memory_refs: list[str] | None = None) -> str:
+             in_reply_to: int | None = None, cost_usd: float = 0.0, memory_refs: list[str] | None = None,
+             tokens_used: int | None = None) -> str:
         """Post into an existing thread. intent: request|propose|accept|reject|inform|result|error|ask_human.
         memory_refs: ids of memory items to share by reference instead of pasting them."""
         return call(client.send, intent, thread_id=thread_id, payload=payload, text=text,
-                    in_reply_to=in_reply_to, cost_usd=cost_usd, memory_refs=memory_refs)
+                    in_reply_to=in_reply_to, cost_usd=cost_usd, memory_refs=memory_refs, tokens_used=tokens_used)
 
     @server.tool()
     def inbox(after: int = 0, wait: float = 0) -> str:

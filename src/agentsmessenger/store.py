@@ -105,6 +105,20 @@ CREATE TABLE IF NOT EXISTS ledger (
   memo TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_ledger_account ON ledger(account, id);
+CREATE TABLE IF NOT EXISTS deliveries (
+  thread_id TEXT PRIMARY KEY,
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  at TEXT NOT NULL,
+  price_usd REAL,
+  cost_usd REAL,
+  eta_s REAL,
+  took_s REAL,
+  tokens_est INTEGER,
+  tokens_used INTEGER,
+  on_time INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_deliveries_agent ON deliveries(agent_id, at);
 """
 REP_COUNTERS = ("tasks", "approved", "rejected", "failed", "earned_usd")
 
@@ -524,3 +538,23 @@ class Store:
     def balance(self, account: str) -> float:
         r = self._db.execute("SELECT COALESCE(SUM(delta_usd), 0) FROM ledger WHERE account=?", (account,)).fetchone()
         return round(float(r[0]), 6)
+
+    # --------------------------------------------------------- deliveries
+    def record_delivery(self, row: dict[str, Any]) -> None:
+        """One finished job: the estimate the agent gave, and what actually happened."""
+        cols = ("thread_id", "agent_id", "kind", "at", "price_usd", "cost_usd", "eta_s", "took_s",
+                "tokens_est", "tokens_used", "on_time")
+        with self._lock, self._db:
+            self._db.execute(f"INSERT OR REPLACE INTO deliveries({', '.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                             [row.get(c) for c in cols])
+
+    def deliveries(self, agent_id: str | None = None, kind: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+        where, params = [], []
+        if agent_id:
+            where.append("agent_id = ?")
+            params.append(agent_id)
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+        sql = "SELECT * FROM deliveries" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY at DESC LIMIT ?"
+        return [dict(r) for r in self._db.execute(sql, [*params, limit]).fetchall()]

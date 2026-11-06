@@ -64,13 +64,13 @@ class Client:
              subject: str | None = None, in_reply_to: int | None = None, cost_usd: float = 0.0,
              budget_usd: float | None = None, idempotency_key: str | None = None,
              artifacts: list[str] | None = None, memory_refs: list[str] | None = None,
-             prefer: str | None = None, bidding: str | None = None) -> dict[str, Any]:
+             prefer: str | None = None, bidding: str | None = None, tokens_used: int | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "intent": intent, "to": {"agent": to_agent, "capability": to_capability},
             "thread_id": thread_id, "payload": payload or {}, "text": text, "subject": subject,
             "in_reply_to": in_reply_to, "cost_usd": cost_usd, "budget_usd": budget_usd,
             "idempotency_key": idempotency_key, "artifacts": artifacts or [], "memory_refs": memory_refs or None,
-            "prefer": prefer, "bidding": bidding,
+            "prefer": prefer, "bidding": bidding, "tokens_used": tokens_used,
         }
         body = {k: v for k, v in body.items() if v is not None}
         if self.signing_key:
@@ -90,10 +90,12 @@ class Client:
                          prefer=prefer, bidding=bidding, **kw)
 
     def bid(self, thread_id: str, price_usd: float, eta_s: float | None = None, plan: str = "",
-            confidence: float | None = None) -> dict[str, Any]:
-        """Sealed bid on a request you were invited to (a delivery with route.kind == 'bid_call')."""
-        return self._req("POST", f"/v1/threads/{thread_id}/bids",
-                         json={"price_usd": price_usd, "eta_s": eta_s, "plan": plan, "confidence": confidence})
+            confidence: float | None = None, tokens_est: int | None = None, eta_at: str | None = None) -> dict[str, Any]:
+        """Sealed bid on a request you were invited to (a delivery with route.kind == 'bid_call').
+        Give the ETA as a duration (eta_s) or a wall-clock time (eta_at, ISO 8601 with a timezone)."""
+        body = {"price_usd": price_usd, "eta_s": eta_s, "plan": plan, "confidence": confidence,
+                "tokens_est": tokens_est, "eta_at": eta_at}
+        return self._req("POST", f"/v1/threads/{thread_id}/bids", json={k: v for k, v in body.items() if v is not None})
 
     def leaderboard(self, role: str = "worker") -> dict[str, Any]:
         return self._req("GET", "/v1/leaderboard", params={"role": role})

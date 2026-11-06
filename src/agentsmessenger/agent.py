@@ -49,6 +49,7 @@ class Result:
     payload: dict[str, Any] = field(default_factory=dict)
     text: str | None = None
     cost_usd: float = 0.0
+    tokens_used: int | None = None  # report it so the work can be checked against your estimate
 
 
 @dataclass
@@ -58,6 +59,8 @@ class Bid:
     eta_s: float | None = None
     plan: str = ""
     confidence: float | None = None
+    tokens_est: int | None = None
+    eta_at: str | None = None  # wall-clock "done by", ISO 8601 with a timezone
 
 
 @dataclass
@@ -259,8 +262,10 @@ class Agent:
                 price = next((me["rates"][k] for k in (cap, kind) if k in (me.get("rates") or {})), me.get("cost_hint_usd"))
                 if price is None:
                     return  # no rate card: let others bid
-                b = Bid(price, self.default_eta_s, f"{me['name']} will handle this with {cap}")
-            self.client.bid(e["thread_id"], b.price_usd, b.eta_s, b.plan, b.confidence)
+                b = Bid(price, me.get("eta_hint_s") or self.default_eta_s, f"{me['name']} will handle this with {cap}",
+                        tokens_est=me.get("tokens_hint"))
+            self.client.bid(e["thread_id"], b.price_usd, None if b.eta_at else b.eta_s, b.plan, b.confidence,
+                            b.tokens_est, b.eta_at)
         except MessengerError:
             pass  # bidding closed or not allowed; nothing to do
 
@@ -299,7 +304,7 @@ class Agent:
             self.client.set_state(tid, "working")
             out = fn(task.payload, task)
             res = out if isinstance(out, Result) else Result(text=out) if isinstance(out, str) else Result(payload=out or {})
-            self.client.reply(e, "result", res.payload, text=res.text, cost_usd=res.cost_usd)
+            self.client.reply(e, "result", res.payload, text=res.text, cost_usd=res.cost_usd, tokens_used=res.tokens_used)
             self.client.set_state(tid, "done")
         except HumanDeclined as ex:
             self._fail(e, f"declined by human: {ex}")
@@ -319,7 +324,7 @@ class Agent:
         caps = sorted(set(me["capabilities"]) | set(self.handlers))
         if caps != me["capabilities"]:
             card = {k: me[k] for k in ("description", "protocols", "vendor", "owner", "cost_hint_usd", "public_key", "a2a_url",
-                                       "rates")}
+                                       "rates", "eta_hint_s", "tokens_hint")}
             self._me = self.client.update_card(me["name"], caps, **card)
 
     def run(self, mode: str = "sse") -> None:

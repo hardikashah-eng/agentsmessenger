@@ -203,7 +203,8 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
 
     def _offers(self, capability: str | None, kind: str, exclude: set[str]) -> list[dict[str, Any]]:
         """Each eligible agent with its standing price (rate card or cost hint)."""
-        return [{"agent": a, "capability": cap, "exact": exact, "price_usd": self.rate_for(a, cap, kind)}
+        return [{"agent": a, "capability": cap, "exact": exact, "price_usd": self.rate_for(a, cap, kind),
+                 "eta_s": a.eta_hint_s, "tokens_est": a.tokens_hint}
                 for a, cap, exact in self._worker_pairs(capability, kind, exclude)]
 
     def apply_route(self, t: Thread, request: Envelope, plan: dict[str, Any]) -> None:
@@ -213,7 +214,7 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         t.assigned_to = best["agent"]
         t.routing = {"request_seq": request.seq, "strategy": plan["strategy"], "candidates": plan["candidates"],
                      "requested_capability": request.to.capability, "price_usd": best["price_usd"],
-                     "tried": [best["agent"]], "assigned_at": utcnow().isoformat(),
+                     "tried": [best["agent"]], **self.estimate_fields(best),
                      "messages": {str(request.seq): {"for": best["agent"], "kind": "work", "capability": best["capability"]}}}
         self.store.save_thread(t)
         self.store.add_participant(t, best["agent"])
@@ -256,13 +257,13 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
             cap = t.capability if t.capability in to_agent.capabilities else \
                 (_matching_cap(to_agent, t.kind or "general") or t.capability)
             nxt = {"agent": to_agent.id, "name": to_agent.name, "capability": cap,
-                   "price_usd": self.rate_for(to_agent, cap, t.kind or "general")}
+                   "price_usd": self.rate_for(to_agent, cap, t.kind or "general"),
+                   "eta_s": to_agent.eta_hint_s, "tokens_est": to_agent.tokens_hint}
         req = self._original_request(t)
         t.owner, t.state, t.assigned_to = None, ThreadState.open, nxt["agent"]
         t.routing["tried"] = sorted(tried | {nxt["agent"]})
-        t.routing["assigned_at"] = utcnow().isoformat()
         t.routing["price_usd"] = nxt.get("price_usd")
-        t.routing["eta_s"] = nxt.get("eta_s")
+        t.routing.update(self.estimate_fields(nxt))
         self.store.save_thread(t)
         self.store.add_participant(t, nxt["agent"])
         self.store.bump_stats(nxt["agent"], assigned=1)

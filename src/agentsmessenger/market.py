@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import random
 import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -68,6 +69,11 @@ def chance(rep: dict[str, Any]) -> float:
 
 def stars(p: float) -> float:
     return round(1 + 4 * p, 1)
+
+
+def _dur(seconds: float) -> str:
+    seconds = int(round(seconds))
+    return f"{seconds}s" if seconds < 120 else f"{seconds // 60}m{seconds % 60:02d}s"
 
 
 class MarketMixin:  # pylint: disable=too-few-public-methods
@@ -112,7 +118,8 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             value = (price if price is not None else fallback) / (p ** k)
             value *= (1 + 0.15 * load) * (1.0 if online else 1.25) * (0.95 if o.get("exact") else 1.0)
             out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "capability": o["capability"],
-                        "price_usd": price, "eta_s": o.get("eta_s"), "chance": round(p, 3), "rating": stars(p),
+                        "price_usd": price, "eta_s": o.get("eta_s"), "tokens_est": o.get("tokens_est"),
+                        "chance": round(p, 3), "rating": stars(p), "traits": self.traits(a.id),
                         "tasks": rep["tasks"], "new": rep["tasks"] < self.market.probation_tasks,
                         "value_usd": round(value, 6), "online": online, "load": load})
         out.sort(key=lambda c: (c["value_usd"], -c["chance"], c["name"]))
@@ -157,8 +164,19 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             self.store.save_thread(t)
 
     def submit_bid(self, agent: AgentRecord, thread_id: str, price_usd: float, eta_s: float | None = None,
-                   plan: str = "", confidence: float | None = None) -> dict[str, Any]:
+                   plan: str = "", confidence: float | None = None, tokens_est: int | None = None,
+                   eta_at: datetime | None = None) -> dict[str, Any]:
+        """eta_at is a wall-clock time ("done by 14:30 UTC"); eta_s a duration. Give either."""
         t = self._thread(thread_id)
+        now = utcnow()
+        if eta_at is not None:
+            if eta_at.tzinfo is None:
+                raise GuardError("bad_bid", "eta_at needs a timezone, e.g. 2026-11-06T14:30:00Z", 422)
+            eta_s = (eta_at - now).total_seconds()
+            if eta_s <= 0:
+                raise GuardError("bad_bid", "eta_at is in the past", 422)
+        if tokens_est is not None and tokens_est < 0:
+            raise GuardError("bad_bid", "tokens_est must be 0 or more", 422)
         m = t.market
         if m.get("status") != "open":
             raise GuardError("bidding_closed", "this request is not open for bids", 409)
@@ -172,8 +190,9 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             raise GuardError("over_budget", f"the budget for this request is ${t.budget_usd:.2f}", 422)
         if t.deadline and eta_s and utcnow() + timedelta(seconds=eta_s) > t.deadline:
             raise GuardError("too_slow", "your ETA is past the request's deadline", 422)
-        m["bids"][agent.id] = {"price_usd": round(price_usd, 6), "eta_s": eta_s, "plan": plan[:1000],
-                               "confidence": confidence, "at": utcnow().isoformat()}
+        m["bids"][agent.id] = {"price_usd": round(price_usd, 6), "eta_s": eta_s, "tokens_est": tokens_est,
+                               "eta_at": (now + timedelta(seconds=eta_s)).isoformat() if eta_s else None,
+                               "plan": plan[:1000], "confidence": confidence, "at": now.isoformat()}
         self.store.save_thread(t)
         if set(m["bids"]) >= set(m["invited"]):
             self.close_auction(self._thread(t.id), "every invited agent bid")
@@ -192,12 +211,13 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             bid = m["bids"].get(aid)
             if bid:
                 offers.append({"agent": a, "capability": m["caps"].get(aid), "price_usd": bid["price_usd"],
-                               "eta_s": bid.get("eta_s")})
+                               "eta_s": bid.get("eta_s"), "tokens_est": bid.get("tokens_est")})
         source = "bids"
         if not offers:  # nobody bid: fall back to the invited agents' rate cards
             source = "rate cards (no bids arrived)"
             offers = [{"agent": agents[aid], "capability": m["caps"].get(aid),
-                       "price_usd": self.rate_for(agents[aid], m["caps"].get(aid), t.kind or "general")}
+                       "price_usd": self.rate_for(agents[aid], m["caps"].get(aid), t.kind or "general"),
+                       "eta_s": agents[aid].eta_hint_s, "tokens_est": agents[aid].tokens_hint}
                       for aid in m["invited"] if aid in agents and not agents[aid].paused]
         ranked = self.rank_workers(offers, t.kind or "general", t.routing.get("strategy"),
                                    None if t.budget_usd is None else t.budget_usd - t.spent_usd)
@@ -212,7 +232,8 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
                          intent=Intent.ask_human)
             return self._thread(t.id)
         best = ranked[0]
-        m["award"] = {"agent": best["agent"], "price_usd": best["price_usd"], "eta_s": best["eta_s"], "source": source}
+        m["award"] = {"agent": best["agent"], "price_usd": best["price_usd"], "eta_s": best["eta_s"],
+                      "tokens_est": best.get("tokens_est"), "source": source}
         self.store.save_thread(t)
         self._award(self._thread(t.id), best, ranked, f"Bidding closed ({why}); {len(m['bids'])} bid(s), from {source}")
         for c in ranked[1:]:
@@ -224,12 +245,14 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
         t.assigned_to, t.owner, t.state = best["agent"], None, ThreadState.open
         t.capability = t.capability or best["capability"]
         t.routing.update({"candidates": ranked[:5], "tried": sorted(set(t.routing.get("tried", [])) | {best["agent"]}),
-                          "assigned_at": utcnow().isoformat(), "price_usd": best["price_usd"], "eta_s": best["eta_s"]})
+                          "price_usd": best["price_usd"], **self.estimate_fields(best)})
         self.store.save_thread(t)
         self.store.add_participant(t, best["agent"])
         self.store.bump_stats(best["agent"], assigned=1)
         price = f"${best['price_usd']:.3f}" if best["price_usd"] is not None else "no price"
-        eta = f", ETA {int(best['eta_s'])}s" if best.get("eta_s") else ""
+        eta = f", due {t.routing['due_at'][11:16]} UTC ({int(best['eta_s'])}s)" if best.get("eta_s") else ""
+        if best.get("tokens_est"):
+            eta += f", ~{best['tokens_est']:,} tokens"
         self._system(t.id, {"event": "awarded", "assigned": best["name"], "price_usd": best["price_usd"],
                             "rating": best["rating"], "bids": len(t.market.get("bids", {}))},
                      f"{why}. Awarded to {best['name']} at {price}{eta}: {best['rating']}★ for {label(t.kind)} "
@@ -273,7 +296,7 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             # Right first time counts fully; each rejection round before approval halves the credit.
             rounds = int(t.verification.get("round", 0))
             self.store.update_reputation(worker, kind, "worker", good=w * 0.5 ** rounds, decay=d, approved=1, tasks=1)
-            self._finish_penalties(t, worker, kind)
+            self.check_delivery(t, worker, kind)
         else:
             self.store.update_reputation(worker, kind, "worker", bad=w, decay=d, rejected=1)
         # Reviewers: a human verdict tells us whether the last agent reviewer got it right.
@@ -287,18 +310,90 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
         else:
             self.store.update_reputation(reviewer, kind, "reviewer", good=0.25, decay=1.0, tasks=1)
 
-    def _finish_penalties(self, t: Thread, worker: str, kind: str) -> None:
+    @staticmethod
+    def estimate_fields(offer: dict[str, Any]) -> dict[str, Any]:
+        """What the winner promised, with the wall-clock time it's due."""
+        now = utcnow()
+        eta = offer.get("eta_s")
+        return {"assigned_at": now.isoformat(), "eta_s": eta, "tokens_est": offer.get("tokens_est"),
+                "due_at": (now + timedelta(seconds=eta)).isoformat() if eta else None}
+
+    def check_delivery(self, t: Thread, worker: str, kind: str) -> dict[str, Any]:
+        """Compare the finished job with the estimate: wall-clock time, tokens and cost.
+        Posts the comparison, keeps it as a delivery record, and counts misses against the worker."""
         r = t.routing
-        if r.get("eta_s") and r.get("assigned_at"):
-            took = (utcnow() - datetime.fromisoformat(r["assigned_at"])).total_seconds()
-            if took > 1.5 * r["eta_s"]:
-                self.store.update_reputation(worker, kind, "worker", bad=0.5)
-                self._system(t.id, {"event": "late", "took_s": int(took)},
-                             f"Finished late: {int(took)}s against an ETA of {int(r['eta_s'])}s.")
-        if r.get("price_usd") is not None:
-            spent = sum(m.cost_usd for m in self.store.thread_messages(t.id, 0, 10_000) if m.sender == worker)
-            if spent > 1.2 * r["price_usd"] + 1e-9:
-                self.store.update_reputation(worker, kind, "worker", bad=0.5)
+        msgs = [m for m in self.store.thread_messages(t.id, 0, 10_000) if m.sender == worker]
+        result = self.store.get_message(t.verification["result_seq"]) if t.verification.get("result_seq") else None
+        start = datetime.fromisoformat(r["assigned_at"]) if r.get("assigned_at") else t.created_at
+        took = ((result.created_at if result else utcnow()) - start).total_seconds()
+        used = sum(m.tokens_used or 0 for m in msgs) if any(m.tokens_used is not None for m in msgs) else None
+        spent = round(sum(m.cost_usd for m in msgs), 6)
+        eta, est, price = r.get("eta_s"), r.get("tokens_est"), r.get("price_usd")
+        on_time = None if not eta else took <= 1.1 * eta
+        row = {"thread_id": t.id, "agent_id": worker, "kind": kind, "at": utcnow().isoformat(), "price_usd": price,
+               "cost_usd": spent, "eta_s": eta, "took_s": round(took, 1), "tokens_est": est, "tokens_used": used,
+               "on_time": None if on_time is None else int(on_time)}
+        self.store.record_delivery(row)
+        parts, misses = [], 0.0
+        if eta:
+            parts.append(f"took {_dur(took)} vs ETA {_dur(eta)} ({'on time' if on_time else 'late'})")
+            if not on_time:
+                misses += 0.5
+        if est and used is not None:
+            parts.append(f"{used:,} tokens vs {est:,} estimated ({(used - est) / est:+.0%})")
+            if used > 1.25 * est:
+                misses += 0.25
+        elif est:
+            parts.append(f"tokens not reported (estimated {est:,})")
+        if price is not None:
+            parts.append(f"cost ${spent:.3f} vs price ${price:.3f}")
+            if spent > 1.2 * price + 1e-9:
+                misses += 0.5
+        if misses:
+            self.store.update_reputation(worker, kind, "worker", bad=misses)
+        r["actuals"] = row
+        self.store.save_thread(t)
+        if parts:
+            self._system(t.id, {"event": "estimate_check", **row}, "Checked against the estimate: " + "; ".join(parts) + ".")
+        return row
+
+    def traits(self, agent_id: str) -> list[str]:
+        """Behaviour badges from the agent's recent deliveries (at least 3 of the relevant kind)."""
+        recent = self.store.deliveries(agent_id, limit=20)
+        out = []
+        timed = [d["on_time"] for d in recent if d["on_time"] is not None]
+        if len(timed) >= 3:
+            rate = sum(timed) / len(timed)
+            out += ["#on-time"] if rate >= 0.8 else ["#late"] if rate <= 0.66 else []
+        tok = [d["tokens_used"] / d["tokens_est"] for d in recent if d["tokens_est"] and d["tokens_used"] is not None]
+        if len(tok) >= 3:
+            if sum(abs(x - 1) <= 0.25 for x in tok) / len(tok) >= 0.8:
+                out.append("#accurate-estimates")
+            elif sum(x > 1.25 for x in tok) / len(tok) >= 0.34:
+                out.append("#token-heavy")
+        costed = [d for d in recent if d["price_usd"] and d["cost_usd"] is not None]
+        if len(costed) >= 3 and sum(d["cost_usd"] > 1.2 * d["price_usd"] for d in costed) / len(costed) >= 0.34:
+            out.append("#over-budget")
+        out += self._price_trait(agent_id, recent)
+        return out
+
+    def _price_trait(self, agent_id: str, recent: list[dict[str, Any]]) -> list[str]:
+        """#expensive / #budget: the agent's typical price against others doing the same type of work."""
+        mine: dict[str, list[float]] = defaultdict(list)
+        for d in recent:
+            if d["price_usd"] is not None:
+                mine[d["kind"]].append(d["price_usd"])
+        for kind, prices in mine.items():
+            others = [d["price_usd"] for d in self.store.deliveries(kind=kind, limit=200)
+                      if d["agent_id"] != agent_id and d["price_usd"] is not None]
+            if len(others) < 2 or not statistics.median(others):
+                continue
+            ratio = statistics.median(prices) / statistics.median(others)
+            if ratio >= 1.5:
+                return ["#expensive"]
+            if ratio <= 0.67:
+                return ["#budget"]
+        return []
 
     def record_failure(self, t: Thread, worker: str, weight: float = 2.0) -> None:
         self.store.update_reputation(worker, t.kind or "general", "worker", bad=weight, decay=self.market.decay, failed=1)
@@ -346,7 +441,12 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             for row in rows:
                 if row["tasks"]:
                     out.setdefault(row["agent"], []).append((row["rank"], f"#{row['rank']} reviewing {label(kind)}"))
-        return {a: [b for _, b in sorted(v)] for a, v in out.items()}
+        ranked = {a: [b for _, b in sorted(v)] for a, v in out.items()}
+        for a in self.store.list_agents():
+            traits = self.traits(a.id)
+            if traits:
+                ranked[a.id] = ranked.get(a.id, []) + traits
+        return ranked
 
 
 __all__ = ["MarketConfig", "MarketMixin", "chance", "label", "stars"]

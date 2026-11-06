@@ -256,6 +256,9 @@ class Bus(MemoryMixin, RouterMixin, MarketMixin):
             if agent is not None and agent.id == t.owner and not self.router.verify:
                 self.store.bump_stats(agent.id, approved=1)
                 self.store.update_reputation(agent.id, t.kind or "general", "worker", tasks=1)
+                if t.routing.get("assigned_at"):
+                    self.check_delivery(t, agent.id, t.kind or "general")
+                    t = self._thread(thread_id)
                 self.settle(t, agent.id)
                 t = self._thread(thread_id)
         if state == ThreadState.failed and agent is not None and agent.id == t.owner and t.routing.get("request_seq"):
