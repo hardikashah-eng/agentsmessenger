@@ -23,9 +23,13 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--require-signatures", action="store_true", help="every agent must register a key and sign envelopes")
     s.add_argument("--no-routing", action="store_true", help="broadcast capability requests instead of assigning one agent")
     s.add_argument("--no-verification", action="store_true", help="don't have another agent check results (not recommended)")
-    s.add_argument("--strategy", choices=["balanced", "cheapest", "quality"], default="balanced", help="default routing preference")
+    s.add_argument("--strategy", choices=["balanced", "cheapest", "quality", "fastest"], default="balanced", help="default routing preference")
     s.add_argument("--claim-timeout", type=float, default=90, help="seconds before unclaimed work goes to the next agent")
     s.add_argument("--review-timeout", type=float, default=300, help="seconds before an unanswered review goes to another reviewer")
+    s.add_argument("--bidding", choices=["instant", "auction"], default="instant",
+                   help="default for requests that don't say: award from rate cards now, or invite sealed bids")
+    s.add_argument("--auction-window", type=float, default=15, help="seconds an auction accepts bids")
+    s.add_argument("--explore", type=float, default=0.1, help="share of work given to newcomers to build a record")
     s.add_argument("--no-human-review", action="store_true",
                    help="when no reviewer agent exists, close without review instead of asking the human")
     s.add_argument("--server-key", default=os.environ.get("AMSG_SERVER_KEY_FILE", "amsg-server.key"),
@@ -78,6 +82,7 @@ def main(argv: list[str] | None = None) -> int:
         import uvicorn
 
         from .bus import Bus
+        from .market import MarketConfig
         from .router import RouterConfig
         from .server import create_app
         from .signing import ServerSigner
@@ -87,8 +92,9 @@ def main(argv: list[str] | None = None) -> int:
         router = RouterConfig(enabled=not a.no_routing, verify=not a.no_verification, strategy=a.strategy,
                               claim_timeout_s=a.claim_timeout, verify_timeout_s=a.review_timeout,
                               human_fallback=not a.no_human_review)
+        market = MarketConfig(mode=a.bidding, auction_window_s=a.auction_window, explore_rate=a.explore)
         bus = Bus(Store(a.db), signer=ServerSigner(key_file=a.server_key), require_signatures=a.require_signatures,
-                  router=router)
+                  router=router, market=market)
         app = create_app(bus, observer_token=token, open_registration=a.open_registration or None)
         print(f"Agents Messenger on http://{a.host}:{a.port}", file=sys.stderr)
         if not os.environ.get("AMSG_OBSERVER_TOKEN"):

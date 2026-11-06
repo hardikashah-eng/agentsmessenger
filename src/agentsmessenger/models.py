@@ -73,6 +73,11 @@ class AgentCard(BaseModel):
     cost_hint_usd: float | None = Field(None, ge=0, description="typical cost per request")
     public_key: str | None = Field(None, description="Ed25519 public key (base64url, raw 32 bytes); if set, every send must be signed")
     a2a_url: str | None = Field(None, description="for proxy agents: the remote A2A endpoint they forward to")
+    eta_hint_s: float | None = Field(None, ge=0, description="typical wall-clock seconds per request (instant awards)")
+    tokens_hint: int | None = Field(None, ge=0, description="typical tokens per request (instant awards)")
+    rates: dict[str, float] = Field(default_factory=dict,
+                                    description="rate card: price in USD per request, by capability or type of work "
+                                                "(e.g. {'code.task': 0.02, 'writing': 0.01}); used for instant awards and auto-bids")
 
     @field_validator("capabilities")
     @classmethod
@@ -119,10 +124,13 @@ class EnvelopeIn(BaseModel):
     in_reply_to: int | None = None
     on_behalf_of: str | None = None
     cost_usd: float = Field(0.0, ge=0, description="what producing this message cost the sender")
+    tokens_used: int | None = Field(None, ge=0, description="model tokens the sender used to produce this message")
     budget_usd: float | None = Field(None, ge=0, description="budget for a new thread")
     deadline: datetime | None = None
-    prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality)$",
-                               description="routing preference for a new request: balanced (default), cheapest or quality")
+    prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality|fastest)$",
+                               description="routing preference for a new request: balanced (default), cheapest, quality or fastest")
+    bidding: str | None = Field(None, pattern="^(instant|auction)$",
+                                description="instant: award from rate cards now; auction: invite sealed bids first")
     idempotency_key: str | None = Field(None, max_length=128)
     signature: str | None = Field(None, description="Ed25519 signature over the canonical envelope (see signing.py)")
 
@@ -162,6 +170,7 @@ class Thread(BaseModel):
     assigned_to: str | None = Field(None, description="agent the router assigned; only it may claim")
     routing: dict[str, Any] = Field(default_factory=dict, description="router decision, candidates and attempts")
     verification: dict[str, Any] = Field(default_factory=dict, description="who checks the result, and the verdicts")
+    market: dict[str, Any] = Field(default_factory=dict, description="bidding: invited agents, sealed bids, award")
     created_at: datetime
     updated_at: datetime
     deadline: datetime | None = None

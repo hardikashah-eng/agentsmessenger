@@ -31,6 +31,7 @@ from .guards import Forbidden, GuardError, NotFound
 from .models import AgentRecord, Envelope, EnvelopeIn, Intent, Thread, ThreadState, TERMINAL, estimate_tokens, utcnow
 
 if TYPE_CHECKING:
+    from .market import MarketConfig
     from .store import Store
 
 HUMAN = "human"
@@ -57,7 +58,7 @@ CATEGORIES: dict[str, dict[str, Any]] = {
         "prefixes": ("code", "dev", "git", "programming"),
         "words": r"\b(code|coding|bug|bugs|function|refactor|implement|unit tests?|pull request|repo|repository|compile|"
                  r"python|javascript|typescript|java|golang|rust|sql|script|deploy|stack ?trace|exception|api endpoint|"
-                 r"regex|dockerfile|frontend|backend)\b|```|def \w+\(|class \w+[:(]",
+                 r"regex|dockerfile|frontend|backend)\b|```|def \w+\(|class \w+[:(]|\b[a-z]+_\w*\([\w, ]*\)",
     },
     "research": {"prefixes": ("research", "web", "search"),
                  "words": r"\b(research|find out|look up|investigate|sources?|compare|market|competitors?|latest)\b"},
@@ -119,6 +120,7 @@ def reliability(stats: dict[str, float]) -> float:
 class RouterMixin:  # pylint: disable=too-few-public-methods
     store: "Store"
     router: RouterConfig
+    market: "MarketConfig"
 
     # Provided by Bus.
     def _thread(self, thread_id: str) -> Thread:
@@ -135,8 +137,9 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
 
     def score_candidates(self, pairs: list[tuple[AgentRecord, str, bool]], strategy: str | None = None,
                          budget_left: float | None = None, prefer_not_vendor: str | None = None,
-                         prefer_not: set[str] | None = None) -> list[dict[str, Any]]:
-        """pairs: (agent, capability it would use, exact match?). Best first, with the reasons."""
+                         prefer_not: set[str] | None = None, kind: str | None = None) -> list[dict[str, Any]]:
+        """Reviewer selection. pairs: (agent, capability it would use, exact match?). Best first, with reasons.
+        With `kind`, an agent's reviewer rating for that type of work replaces its overall track record."""
         w = WEIGHTS.get(strategy or self.router.strategy, WEIGHTS["balanced"])
         now = utcnow()
         costs = [a.cost_hint_usd for a, _, _ in pairs if a.cost_hint_usd is not None]
@@ -146,8 +149,9 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
             if budget_left is not None and a.cost_hint_usd is not None and a.cost_hint_usd > budget_left + 1e-9:
                 continue  # can't afford it
             st = self.store.stats(a.id)
+            rep = self.store.reputation(a.id, kind, "reviewer") if kind else None
             parts = {
-                "reliability": reliability(st),
+                "reliability": rep["alpha"] / (rep["alpha"] + rep["beta"]) if rep else reliability(st),
                 "cost": 0.5 if a.cost_hint_usd is None else (1.0 if top <= 0 else 1 - a.cost_hint_usd / top * 0.9),
                 "load": 1 / (1 + self.store.load(a.id)),
                 "online": 1.0 if self.is_online(a, now) else 0.3,
@@ -187,14 +191,21 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
                 raise GuardError("no_recipient", "routing is off; address an agent or a capability", 422)
             return None
         kind = classify(env.to.capability, env.payload, env.text, env.subject)
-        budget = env.budget_usd if env.budget_usd is not None else None
-        ranked = self.score_candidates(self._worker_pairs(env.to.capability, kind, {sender_id}),
-                                       env.prefer, budget_left=budget)
+        mode = env.bidding or self.market.mode
+        ranked = self.rank_workers(self._offers(env.to.capability, kind, {sender_id}), kind,
+                                   env.prefer or self.router.strategy, env.budget_usd, explore=mode == "instant")
         if not ranked:
             if env.to.capability:
                 raise NotFound(f"no available agent offers capability {env.to.capability!r} within budget")
             raise NotFound(f"no agent can handle this {kind} request; add one with `amsg add`, or address a capability")
-        return {"kind": kind, "strategy": env.prefer or self.router.strategy, "candidates": ranked[:5]}
+        return {"kind": kind, "strategy": env.prefer or self.router.strategy, "mode": mode,
+                "candidates": ranked if mode == "auction" else ranked[:5]}
+
+    def _offers(self, capability: str | None, kind: str, exclude: set[str]) -> list[dict[str, Any]]:
+        """Each eligible agent with its standing price (rate card or cost hint)."""
+        return [{"agent": a, "capability": cap, "exact": exact, "price_usd": self.rate_for(a, cap, kind),
+                 "eta_s": a.eta_hint_s, "tokens_est": a.tokens_hint}
+                for a, cap, exact in self._worker_pairs(capability, kind, exclude)]
 
     def apply_route(self, t: Thread, request: Envelope, plan: dict[str, Any]) -> None:
         best = plan["candidates"][0]
@@ -202,8 +213,8 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         t.capability = t.capability or best["capability"]
         t.assigned_to = best["agent"]
         t.routing = {"request_seq": request.seq, "strategy": plan["strategy"], "candidates": plan["candidates"],
-                     "requested_capability": request.to.capability,
-                     "tried": [best["agent"]], "assigned_at": utcnow().isoformat(),
+                     "requested_capability": request.to.capability, "price_usd": best["price_usd"],
+                     "tried": [best["agent"]], **self.estimate_fields(best),
                      "messages": {str(request.seq): {"for": best["agent"], "kind": "work", "capability": best["capability"]}}}
         self.store.save_thread(t)
         self.store.add_participant(t, best["agent"])
@@ -213,11 +224,15 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
 
     @staticmethod
     def _explain(best: dict[str, Any], others: list[dict[str, Any]], kind: str | None) -> str:
-        cost = f"${best['cost_hint_usd']:.3f}/request" if best["cost_hint_usd"] is not None else "cost unknown"
-        why = f"Router: {kind or 'request'} work assigned to {best['name']} ({best['capability']}; score {best['score']}; " \
-              f"{cost}; {best['track_record']}; {'online' if best['online'] else 'not seen recently'})."
+        cost = f"${best['price_usd']:.3f}/request" if best["price_usd"] is not None else "price unknown"
+        why = f"Router: {kind or 'request'} work assigned to {best['name']} ({best['capability']}; {cost}; " \
+              f"{best['rating']}★ from {best['tasks']} {kind or ''} tasks; value ${best['value_usd']:.4f} per approved " \
+              f"result; {'online' if best['online'] else 'not seen recently'}" + \
+              (f"; ETA {int(best['eta_s'])}s" + (f", usually {best['eta_slip']}x that" if best.get("eta_slip", 1) != 1 else "")
+               if best.get("eta_s") else "") + \
+              ("; a newcomer getting a chance to build a record" if best.get("explored") else "") + ")."
         if others:
-            why += " Next in line: " + ", ".join(f"{o['name']} ({o['score']})" for o in others[:3]) + "."
+            why += " Next in line: " + ", ".join(f"{o['name']} (${o['value_usd']:.4f})" for o in others[:3]) + "."
         return why
 
     def reroute(self, t: Thread, reason: str, to_agent: AgentRecord | None = None,
@@ -226,9 +241,14 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         failure, return None so the thread fails; otherwise (nobody responded) ask the human."""
         tried = set(t.routing.get("tried", []))
         if to_agent is None:
-            ranked = [] if len(tried) >= self.router.max_attempts else self.score_candidates(
-                self._worker_pairs(t.routing.get("requested_capability"), t.kind or "general", tried | {t.creator}),
-                t.routing.get("strategy"))
+            if len(tried) >= self.router.max_attempts:
+                ranked = []
+            elif t.market.get("status") == "awarded":  # next-best bid
+                ranked = [c for c in t.routing.get("candidates", []) if c["agent"] not in tried]
+            else:
+                ranked = self.rank_workers(
+                    self._offers(t.routing.get("requested_capability"), t.kind or "general", tried | {t.creator}),
+                    t.kind or "general", t.routing.get("strategy"), explore=False)
             if not ranked:
                 if on_failure:
                     return None
@@ -236,13 +256,16 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
                 return self._escalate(t, f"{reason}; {why}. Assign it to an agent or close it")
             nxt = ranked[0]
         else:
-            nxt = {"agent": to_agent.id, "name": to_agent.name, "score": None,
-                   "capability": t.capability if t.capability in to_agent.capabilities else
-                   (_matching_cap(to_agent, t.kind or "general") or t.capability)}
+            cap = t.capability if t.capability in to_agent.capabilities else \
+                (_matching_cap(to_agent, t.kind or "general") or t.capability)
+            nxt = {"agent": to_agent.id, "name": to_agent.name, "capability": cap,
+                   "price_usd": self.rate_for(to_agent, cap, t.kind or "general"),
+                   "eta_s": to_agent.eta_hint_s, "tokens_est": to_agent.tokens_hint}
         req = self._original_request(t)
         t.owner, t.state, t.assigned_to = None, ThreadState.open, nxt["agent"]
         t.routing["tried"] = sorted(tried | {nxt["agent"]})
-        t.routing["assigned_at"] = utcnow().isoformat()
+        t.routing["price_usd"] = nxt.get("price_usd")
+        t.routing.update(self.estimate_fields(nxt))
         self.store.save_thread(t)
         self.store.add_participant(t, nxt["agent"])
         self.store.bump_stats(nxt["agent"], assigned=1)
@@ -316,12 +339,14 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         for a in self.store.list_agents():
             if a.paused or a.id == worker.id or a.id in tried:
                 continue
+            if worker.owner and a.owner == worker.owner:
+                continue  # an owner's agents don't review each other's work
             cap = next((c for c in caps if c in a.capabilities), None)
             if cap:
                 pairs.append((a, cap, cap == caps[0]))
         budget_left = None if t.budget_usd is None else t.budget_usd - t.spent_usd
         ranked = self.score_candidates(pairs, "quality", budget_left=budget_left,
-                                       prefer_not_vendor=worker.vendor or None, prefer_not={t.creator})
+                                       prefer_not_vendor=worker.vendor or None, prefer_not={t.creator}, kind=kind)
         v.update({"status": "pending", "worker": worker.id, "result_seq": result.seq, "kind": kind,
                   "round": v.get("round", 0), "requested_at": utcnow().isoformat(),
                   "history": v.get("history", [])})
@@ -402,6 +427,9 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
             if worker:
                 self.store.bump_stats(worker, approved=1)
             self.store.save_thread(t)
+            self.record_review(t, worker, verifier_id, "approve")
+            self.settle(self._thread(t.id), worker)
+            t = self._thread(t.id)
             self._system(t.id, {"event": "verified", "verdict": "approve", "by": who, "notes": notes},
                          f"Verified by {who}: approved." + (f" {notes}" if notes else ""))
             return self._thread(t.id)
@@ -415,6 +443,7 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         if worker:
             self.store.bump_stats(worker, rejected=1)
         self.store.save_thread(t)
+        self.record_review(t, worker, verifier_id, "reject")
         if v["round"] >= self.router.max_review_rounds or not worker or verifier_id == HUMAN and not t.owner:
             return self._escalate(t, f"{who} rejected the result {v['round']} time(s): {notes or 'no notes'}")
         t.state = ThreadState.working
@@ -463,11 +492,14 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         if not self.router.enabled and not self.router.verify:
             return []
         now = now or utcnow()
-        acted = []
+        acted = self.tick_market(now)
         for t in self.store.threads_in_states(["open", "verifying"]):
+            if t.market.get("status") == "open":
+                continue
             if t.state == ThreadState.open and t.assigned_to and not t.owner and t.routing.get("assigned_at"):
                 if now - datetime.fromisoformat(t.routing["assigned_at"]) > timedelta(seconds=self.router.claim_timeout_s):
                     self.store.bump_stats(t.assigned_to, timeouts=1)
+                    self.record_failure(t, t.assigned_to, weight=1.0)
                     name = getattr(self.store.get_agent(t.assigned_to), "name", t.assigned_to)
                     self.reroute(t, f"{name} did not pick it up within {int(self.router.claim_timeout_s)}s")
                     acted.append(t.id)

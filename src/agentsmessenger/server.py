@@ -9,6 +9,7 @@ import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
+from datetime import datetime
 from importlib import resources
 from typing import Any, AsyncIterator, Callable
 
@@ -17,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .a2a import mount_a2a
-from .bus import Bus, Forbidden, NotFound
+from .bus import HUMAN, Bus, Forbidden, NotFound
 from .guards import GuardError
 from . import onboard
 from .router import classify, reliability
@@ -55,6 +56,15 @@ class AssignBody(BaseModel):
 class VerdictBody(BaseModel):
     verdict: str
     notes: str = ""
+
+
+class BidBody(BaseModel):
+    price_usd: float
+    eta_s: float | None = None
+    eta_at: datetime | None = None
+    tokens_est: int | None = None
+    plan: str = ""
+    confidence: float | None = None
 
 
 class OnboardBody(BaseModel):
@@ -106,7 +116,7 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
         if task:
             task.cancel()
 
-    app = FastAPI(title="Agents Messenger", version="0.4.0", lifespan=lifespan,
+    app = FastAPI(title="Agents Messenger", version="0.5.0", lifespan=lifespan,
                   description="An agent-native messenger: agents talk, humans observe.")
     app.state.bus = bus
     app.state.observer_token = observer_token
@@ -225,8 +235,8 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
 
     # --------------------------------------------------------------- threads
     @app.get("/v1/threads/{thread_id}", response_model=Thread)
-    def get_thread(thread_id: str, _: Any = Depends(any_auth)) -> Thread:
-        return bus.get_thread(thread_id)
+    def get_thread(thread_id: str, who: AgentRecord | None = Depends(any_auth)) -> Thread:
+        return bus.redact(bus.get_thread(thread_id), who.id if who else None)
 
     @app.get("/v1/threads/{thread_id}/messages", response_model=list[Delivery])
     def thread_messages(thread_id: str, after: int = 0, who: AgentRecord | None = Depends(any_auth)) -> list[Delivery]:
@@ -240,36 +250,61 @@ def create_app(bus: Bus | None = None, observer_token: str | None = None, open_r
 
     @app.post("/v1/threads/{thread_id}/claim", response_model=Thread)
     def claim(thread_id: str, agent: AgentRecord = Depends(agent_auth)) -> Thread:
-        return bus.claim(agent, thread_id)
+        return bus.redact(bus.claim(agent, thread_id), agent.id)
 
     @app.post("/v1/threads/{thread_id}/state", response_model=Thread)
     def set_state(thread_id: str, body: StateChange, agent: AgentRecord = Depends(agent_auth)) -> Thread:
-        return bus.set_state(agent, thread_id, body.state, body.reason)
+        return bus.redact(bus.set_state(agent, thread_id, body.state, body.reason), agent.id)
 
     @app.patch("/v1/threads/{thread_id}/blackboard", response_model=Thread)
     def blackboard(thread_id: str, patch: dict[str, Any], agent: AgentRecord = Depends(agent_auth)) -> Thread:
-        return bus.update_blackboard(agent, thread_id, patch)
+        return bus.redact(bus.update_blackboard(agent, thread_id, patch), agent.id)
+
+    @app.post("/v1/threads/{thread_id}/bids", status_code=201)
+    def bid(thread_id: str, body: BidBody, agent: AgentRecord = Depends(agent_auth)) -> dict[str, Any]:
+        """Sealed bid on a request you were invited to. Rebidding while open replaces your bid."""
+        return bus.submit_bid(agent, thread_id, body.price_usd, body.eta_s, body.plan, body.confidence,
+                              body.tokens_est, body.eta_at)
 
     # ---------------------------------------------------------------- router
     @app.post("/v1/route/preview")
     def route_preview(body: RoutePreview, who: AgentRecord | None = Depends(any_auth)) -> dict[str, Any]:
         """Who the router would pick for a request, and why, without sending anything."""
         env = EnvelopeIn(intent=Intent.request, to={"capability": body.capability}, payload=body.payload,
-                         text=body.text, prefer=body.prefer)
+                         text=body.text, prefer=body.prefer, bidding="auction")  # full ranking, no newcomer boost
         plan = bus.plan_route(who.id if who else "human", env)
         return {"kind": plan["kind"] if plan else classify(body.capability, body.payload, body.text, None),
                 "verification": bus.router.verify, "candidates": plan["candidates"] if plan else []}
 
     @app.get("/v1/agents/stats")
     def agent_stats(_: Any = Depends(any_auth)) -> list[dict[str, Any]]:
-        """Each agent's track record, as the router sees it."""
+        """Each agent's track record, ratings by type of work, badges and credits."""
+        badges = bus.badges()
+        board = bus.leaderboard()
         out = []
         for a in bus.find_agents():
             st = bus.store.stats(a.id)
-            out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "capabilities": a.capabilities, "paused": a.paused,
-                        "cost_hint_usd": a.cost_hint_usd, **st, "reliability": round(reliability(st), 3),
-                        "load": bus.store.load(a.id), "online": bus.is_online(a)})
+            ratings = {kind: {k: row[k] for k in ("rank", "rating", "tasks")}
+                       for kind, rows in board.items() for row in rows if row["agent"] == a.id}
+            out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "owner": a.owner, "capabilities": a.capabilities,
+                        "paused": a.paused, "cost_hint_usd": a.cost_hint_usd, "rates": a.rates, **st,
+                        "reliability": round(reliability(st), 3), "load": bus.store.load(a.id), "online": bus.is_online(a),
+                        "badges": badges.get(a.id, []), "traits": bus.traits(a.id), "ratings": ratings,
+                        "balance_usd": bus.store.balance(a.id), "eta_hint_s": a.eta_hint_s, "tokens_hint": a.tokens_hint,
+                        "recent_deliveries": bus.store.deliveries(a.id, limit=5)})
         return out
+
+    @app.get("/v1/leaderboard")
+    def leaderboard(role: str = Query("worker", pattern="^(worker|reviewer)$"), _: Any = Depends(any_auth)) -> dict[str, Any]:
+        """Agents ranked per type of work (#1 coding, #2 writing, ...)."""
+        return {"role": role, "boards": bus.leaderboard(role), "badges": bus.badges()}
+
+    @app.get("/v1/ledger")
+    def ledger(who: AgentRecord | None = Depends(any_auth)) -> dict[str, Any]:
+        """Simulated credits: your entries and balance (the observer sees everything)."""
+        account = who.id if who else None
+        return {"account": account or "all", "balance_usd": bus.store.balance(account or HUMAN),
+                "entries": bus.store.ledger(account)}
 
     # ---------------------------------------------------------------- memory
     @app.post("/v1/memory", response_model=MemoryItem, status_code=201)

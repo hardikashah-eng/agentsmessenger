@@ -35,6 +35,17 @@ button.warn{color:var(--warn)}
 .dot.on{background:#1E7A46}
 fieldset{border:1px solid var(--line);border-radius:6px;margin:8px 0;padding:6px 8px}
 .stack{display:flex;flex-direction:column;gap:6px}
+.tag{display:inline-block;font:600 11px/1.6 system-ui,sans-serif;padding:0 7px;border-radius:999px;background:color-mix(in srgb,var(--accent) 14%,transparent);color:var(--accent);margin:2px 4px 0 0}
+.tag.gold{background:color-mix(in srgb,#B7791F 18%,transparent);color:#8A5A12}
+@media (prefers-color-scheme:dark){.tag.gold{color:#F0C060}}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:500}
+.win td{font-weight:600}
+.tag.good{background:color-mix(in srgb,#1E7A46 16%,transparent);color:#1E7A46}
+.tag.bad{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn)}
+@media (prefers-color-scheme:dark){.tag.good{color:#6FD39A}}
+.ok{color:#1E7A46}.miss{color:var(--warn)}
 .msg{border-top:1px solid var(--line);padding:10px 0}
 .msg .head{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 pre{background:var(--code);color:var(--codeink);padding:8px 10px;border-radius:6px;overflow-x:auto;font-size:12px;margin:6px 0 0}
@@ -58,6 +69,7 @@ label{font-size:12px;color:var(--muted)}
 <main>
   <div id="left">
     <section><h2>Threads</h2><div id="threads" class="muted">Connect to see threads.</div></section>
+    <section><h2>Leaderboard</h2><div id="board" class="muted">No finished work yet.</div></section>
     <section><h2>Agents</h2><div id="agents"></div>
       <button class="primary" id="addbtn" style="margin-top:8px">Add agent</button>
       <div id="addagent" hidden></div></section>
@@ -86,7 +98,8 @@ async function api(path, opts = {}) {
 let names = {};
 async function refresh() {
   try {
-    const [threads, agents] = await Promise.all([api("/v1/observe/threads"), api("/v1/agents/stats")]);
+    const [threads, agents, board] = await Promise.all([api("/v1/observe/threads"), api("/v1/agents/stats"), api("/v1/leaderboard")]);
+    renderBoard(board);
     names = Object.fromEntries(agents.map((a) => [a.agent, a.name])); names.human = "you"; names.system = "system";
     window._agents = agents;
     $("status").textContent = "live";
@@ -102,7 +115,8 @@ function renderAgents(agents) {
     box.append(el("div", { class: "row", style: "justify-content:space-between;margin-bottom:8px" },
       el("div", {}, el("span", { class: "dot" + (a.online ? " on" : ""), title: a.online ? "online" : "not seen recently" }),
         el("span", { class: "badge" }, a.name), " ", el("span", { class: "muted" }, (a.vendor || "") + " · " + (a.capabilities.join(", ") || "no capabilities")),
-        el("div", { class: "muted", style: "font-size:12px" }, record + (a.cost_hint_usd != null ? ` · ~$${a.cost_hint_usd}/request` : ""))),
+        el("div", { class: "muted", style: "font-size:12px" }, record + (a.cost_hint_usd != null ? ` · ~$${a.cost_hint_usd}/request` : "") + (a.balance_usd > 0 ? ` · earned $${a.balance_usd.toFixed(3)}` : a.balance_usd < 0 ? ` · spent $${(-a.balance_usd).toFixed(3)}` : "")),
+        el("div", {}, ...(a.badges || []).map((b) => el("span", { class: "tag " + badgeClass(b), title: badgeHelp(b) }, b)))),
       el("button", { class: a.paused ? "" : "warn", onclick: async () => { await api(`/v1/observe/agents/${a.agent}/${a.paused ? "resume" : "pause"}`, { method: "POST" }); refresh(); } }, a.paused ? "Resume" : "Pause")));
   }
 }
@@ -111,7 +125,8 @@ function renderThreads(threads) {
   if (!threads.length) box.append(el("div", { class: "muted" }, "No threads yet."));
   for (const t of threads) {
     box.append(el("button", { class: "item" + (t.id === selected ? " sel" : ""), onclick: () => { selected = t.id; refresh(); } },
-      el("div", { class: "row", style: "justify-content:space-between" }, el("strong", {}, t.subject), el("span", { class: "badge s-" + t.state }, t.state)),
+      el("div", { class: "row", style: "justify-content:space-between" }, el("strong", {}, t.subject), el("span", { class: "badge s-" + t.state }, t.market && t.market.status === "open" ? "bidding" : t.state)),
+      t.kind ? el("span", { class: "tag" }, "#" + kindLabel(t.kind)) : null,
       el("div", { class: "muted" }, `${t.message_count} msgs · $${t.spent_usd.toFixed(3)}${t.budget_usd != null ? " / $" + t.budget_usd.toFixed(2) : ""} · ${t.owner ? "owner " + (names[t.owner] || t.owner) : "unclaimed"}`)));
   }
 }
@@ -157,13 +172,73 @@ async function renderThread(id) {
   box.append(el("form", { style: "margin-top:12px", onsubmit: async (ev) => { ev.preventDefault(); if (!ta.value.trim()) return; await api(`/v1/observe/threads/${id}/messages`, { method: "POST", body: JSON.stringify({ text: ta.value }) }); ta.value = ""; refresh(); } },
     el("label", { for: "say" }, t.state === "waiting_human" ? "Your answer" : "Message as human"), ta, el("div", { class: "row", style: "margin-top:6px" }, el("button", { class: "primary", type: "submit" }, "Send"))));
 }
+const KINDS = { code: "coding", summarize: "summarizing", payment: "payments" };
+const GOOD = ["#on-time", "#accurate-estimates", "#budget"], BAD = ["#late", "#token-heavy", "#over-budget", "#pads-estimates"];
+const HELP = { "#on-time": "finishes within its ETA", "#late": "often finishes after its ETA",
+  "#accurate-estimates": "token use close to its estimates", "#token-heavy": "often uses more tokens than estimated",
+  "#over-budget": "often costs more than its price", "#expensive": "priced well above others for this work",
+  "#budget": "priced well below others for this work",
+  "#pads-estimates": "ETAs or token estimates are usually far too generous" };
+function badgeClass(b) { return b.startsWith("#1 ") ? "gold" : GOOD.includes(b) ? "good" : BAD.includes(b) ? "bad" : ""; }
+function badgeHelp(b) { return HELP[b] || "rank for this type of work"; }
+function dur(s) { s = Math.round(s); return s < 120 ? s + "s" : Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s"; }
+function renderActuals(t, box) {
+  const r = t.routing || {}, a = r.actuals;
+  if (!a && !r.eta_s && !r.tokens_est) return;
+  const rows = [];
+  const line = (label, est, act, ok) => rows.push(el("tr", {}, el("td", {}, label), el("td", {}, est), el("td", {}, act ?? "—"),
+    el("td", { class: ok == null ? "muted" : ok ? "ok" : "miss" }, ok == null ? "" : ok ? "✓" : "✗")));
+  line("Time", r.eta_s ? dur(r.eta_s) + (r.due_at ? ` (due ${new Date(r.due_at).toLocaleTimeString()})` : "") : "—",
+    a ? dur(a.took_s) : null, a && a.on_time != null ? !!a.on_time : null);
+  line("Tokens", r.tokens_est ? r.tokens_est.toLocaleString() : "—", a && a.tokens_used != null ? a.tokens_used.toLocaleString() : null,
+    a && a.tokens_est && a.tokens_used != null ? a.tokens_used <= 1.25 * a.tokens_est : null);
+  line("Cost", r.price_usd != null ? "$" + r.price_usd.toFixed(3) : "—", a ? "$" + a.cost_usd.toFixed(3) : null,
+    a && a.price_usd != null ? a.cost_usd <= 1.2 * a.price_usd + 1e-9 : null);
+  box.append(el("div", { class: "box" }, el("h3", {}, "Estimate vs actual"),
+    el("table", {}, el("tr", {}, el("th", {}, ""), el("th", {}, "Estimate"), el("th", {}, "Actual"), el("th", {}, "")), ...rows),
+    a ? null : el("div", { class: "muted" }, "Checked when the work is approved.")));
+}
+function kindLabel(k) { return KINDS[k] || k || "general"; }
+function renderBoard(board) {
+  const box = $("board"); box.replaceChildren();
+  const kinds = Object.entries(board.boards || {});
+  if (!kinds.length) { box.append(el("div", { class: "muted" }, "No finished work yet.")); return; }
+  for (const [kind, rows] of kinds) {
+    box.append(el("div", { style: "margin-bottom:8px" }, el("span", { class: "tag" }, "#" + kindLabel(kind)),
+      ...rows.slice(0, 3).map((r) => el("div", { class: "row", style: "justify-content:space-between;font-size:13px" },
+        el("span", {}, el("strong", {}, `#${r.rank} `), r.name, r.new ? el("span", { class: "muted" }, " · new") : null),
+        el("span", { class: "muted" }, `${r.rating}★ · ${r.tasks} tasks${r.earned_usd ? " · $" + r.earned_usd.toFixed(3) : ""}`)))));
+  }
+}
+function renderMarket(t, box) {
+  const m = t.market || {};
+  if (!m.mode) return;
+  const bids = m.bids || {}, award = m.award || {};
+  const b = el("div", { class: "box" }, el("h3", {}, "Bids"),
+    el("div", {}, m.status === "open" ? `Open until ${new Date(m.closes_at).toLocaleTimeString()} · ${Object.keys(bids).length} of ${m.invited.length} bids in (sealed)`
+      : `${m.status} · ${Object.keys(bids).length} bid(s)` + (award.source ? ` · from ${award.source}` : "")));
+  const rows = Object.entries(bids).sort((x, y) => x[1].price_usd - y[1].price_usd);
+  if (rows.length) {
+    const table = el("table", {}, el("tr", {}, el("th", {}, "Agent"), el("th", {}, "Price"), el("th", {}, "ETA (done by)"), el("th", {}, "Tokens"), el("th", {}, "Plan")));
+    for (const [aid, bid] of rows) table.append(el("tr", { class: aid === award.agent ? "win" : "" },
+      el("td", {}, (aid === award.agent ? "✓ " : "") + (names[aid] || aid)), el("td", {}, "$" + bid.price_usd.toFixed(3)),
+      el("td", {}, bid.eta_s ? dur(bid.eta_s) + (bid.eta_at ? ` (${new Date(bid.eta_at).toLocaleTimeString()})` : "") : "—"),
+      el("td", {}, bid.tokens_est != null ? bid.tokens_est.toLocaleString() : "—"), el("td", { class: "muted" }, bid.plan || "")));
+    b.append(table);
+  }
+  if (t.routing && t.routing.paid) b.append(el("div", { class: "muted" }, `Paid $${t.routing.paid.toFixed(3)} on approval (simulated credits).`));
+  box.append(b);
+}
 function renderCoordination(t, id, box) {
   const done = t.state === "done" || t.state === "failed";
+  renderMarket(t, box);
+  renderActuals(t, box);
   if (t.routing && t.routing.candidates) {
     const r = el("div", { class: "box" }, el("h3", {}, "Router"),
-      el("div", {}, `${t.kind || "request"} work · ${t.routing.strategy || "balanced"} · assigned to `, el("strong", {}, names[t.assigned_to || t.owner] || "—")));
+      el("div", {}, el("span", { class: "tag" }, "#" + kindLabel(t.kind)), ` ${t.routing.strategy || "balanced"} · assigned to `, el("strong", {}, names[t.assigned_to || t.owner] || "—"),
+        t.routing.price_usd != null ? ` at $${t.routing.price_usd.toFixed(3)}` : ""));
     const list = el("div", { class: "muted", style: "font-size:12px" });
-    for (const c of t.routing.candidates) list.append(el("div", {}, `${c.name}: score ${c.score} · ${c.cost_hint_usd != null ? "$" + c.cost_hint_usd : "cost ?"} · ${c.track_record}`));
+    for (const c of t.routing.candidates) list.append(el("div", {}, `${c.name}: ${c.price_usd != null ? "$" + c.price_usd.toFixed(3) : "price ?"} · ${c.rating}★ (${c.tasks} tasks) · value ${c.value_usd != null ? "$" + c.value_usd.toFixed(4) : "sealed"}${c.eta_s ? " · ETA " + dur(c.eta_s) + (c.eta_slip && c.eta_slip !== 1 ? ` (usually ${c.eta_slip}×)` : "") : ""}${c.explored ? " · newcomer chance" : ""}`));
     r.append(list);
     if (!done && window._agents) {
       const sel = el("select", { "aria-label": "Reassign to" }, ...window._agents.map((a) => el("option", { value: a.name }, a.name)));
