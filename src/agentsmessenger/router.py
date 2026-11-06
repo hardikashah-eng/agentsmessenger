@@ -228,6 +228,8 @@ class RouterMixin:  # pylint: disable=too-few-public-methods
         why = f"Router: {kind or 'request'} work assigned to {best['name']} ({best['capability']}; {cost}; " \
               f"{best['rating']}★ from {best['tasks']} {kind or ''} tasks; value ${best['value_usd']:.4f} per approved " \
               f"result; {'online' if best['online'] else 'not seen recently'}" + \
+              (f"; ETA {int(best['eta_s'])}s" + (f", usually {best['eta_slip']}x that" if best.get("eta_slip", 1) != 1 else "")
+               if best.get("eta_s") else "") + \
               ("; a newcomer getting a chance to build a record" if best.get("explored") else "") + ")."
         if others:
             why += " Next in line: " + ", ".join(f"{o['name']} (${o['value_usd']:.4f})" for o in others[:3]) + "."

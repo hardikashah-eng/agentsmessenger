@@ -93,7 +93,7 @@ def test_on_time_delivery_is_checked_against_estimate(env):
     user = agent("user")
     coder = agent("coder", ["code.task"], owner="alice")
     rev = agent("rev", ["code.review"], owner="bob")
-    tid = _auction_job(bus, user, coder, rev)
+    tid = _auction_job(bus, user, coder, rev, took_s=100)  # 100s against a 120s ETA
     t = bus.get_thread(tid)
     a = t.routing["actuals"]
     assert a["on_time"] == 1 and a["tokens_used"] == 1800 and a["tokens_est"] == 2000 and a["cost_usd"] == 0.018
@@ -109,7 +109,7 @@ def test_late_and_token_heavy_delivery_costs_reputation(env):
     slow = agent("slow", ["code.task"], owner="carol")
     rev = agent("rev", ["code.review"], owner="bob")
     bus.store.set_agent_paused(slow.me()["id"], True)
-    _auction_job(bus, user, punctual, rev)
+    _auction_job(bus, user, punctual, rev, took_s=100)
     bus.store.set_agent_paused(slow.me()["id"], False)
     bus.store.set_agent_paused(punctual.me()["id"], True)
     tid = _auction_job(bus, user, slow, rev, took_s=1000, tokens_used=5000)
@@ -161,3 +161,61 @@ def test_framework_bids_estimates_and_reports_tokens(env, tmp_path, monkeypatch)
     bot._run(bot.handlers["code.task"], work["envelope"], [], work["route"])  # pylint: disable=protected-access
     result = [d["envelope"] for d in user.messages(tid) if d["envelope"]["intent"] == "result"][-1]
     assert result["tokens_used"] == 2400 and result["verified"] is False
+
+
+def _history(bus, c, n, eta_s, took_s, kind="code", tokens=(None, None)):
+    for i in range(n):
+        bus.store.record_delivery({"thread_id": f"h-{c.me()['name']}-{i}", "agent_id": c.me()["id"], "kind": kind,
+                                   "at": utcnow().isoformat(), "price_usd": 0.02, "cost_usd": 0.02, "eta_s": eta_s,
+                                   "took_s": took_s, "tokens_est": tokens[0], "tokens_used": tokens[1],
+                                   "on_time": int(took_s <= 1.1 * eta_s)})
+
+
+def test_shorter_eta_wins_and_padding_does_not_pay(env):
+    bus, _, agent = env
+    user = agent("user")
+    quick = agent("quick", ["code.task"], rates={"code.task": 0.02}, eta_hint_s=60)
+    agent("padder", ["code.task"], rates={"code.task": 0.02}, eta_hint_s=600)
+    t = bus.get_thread(user.request("code.task", {"x": 1})["thread_id"])
+    assert t.assigned_to == quick.me()["id"]  # same price and rating: the faster promise wins
+
+
+def test_eta_is_corrected_by_track_record(env):
+    bus, _, agent = env
+    user = agent("user")
+    overpromiser = agent("overpromiser", ["code.task"], rates={"code.task": 0.02}, eta_hint_s=30)
+    honest = agent("honest", ["code.task"], rates={"code.task": 0.02}, eta_hint_s=60)
+    _history(bus, overpromiser, 4, eta_s=30, took_s=120)   # usually takes 4x its ETA (capped at 3x)
+    _history(bus, honest, 4, eta_s=60, took_s=60)
+    t = bus.get_thread(user.request("code.task", {"x": 1})["thread_id"])
+    assert t.assigned_to == honest.me()["id"]
+    over = next(c for c in t.routing["candidates"] if c["name"] == "overpromiser")
+    assert over["eta_slip"] == 3.0 and over["credible_eta_s"] == 90.0
+
+
+def test_missing_eta_counts_as_slower_and_fastest_preference(env):
+    bus, _, agent = env
+    user = agent("user")
+    agent("no-eta", ["code.task"], rates={"code.task": 0.02})
+    typed = agent("with-eta", ["code.task"], rates={"code.task": 0.02}, eta_hint_s=120)
+    assert bus.get_thread(user.request("code.task", {"x": 1})["thread_id"]).assigned_to == typed.me()["id"]
+
+    # 12x faster but 3x the price: balanced won't pay that much for speed; fastest will.
+    fast = agent("fast-pricey", ["code.task"], rates={"code.task": 0.06}, eta_hint_s=10)
+    assert bus.get_thread(user.request("code.task", {"x": 2})["thread_id"]).assigned_to != fast.me()["id"]
+    assert bus.get_thread(user.request("code.task", {"x": 3}, prefer="fastest")["thread_id"]).assigned_to == fast.me()["id"]
+
+
+def test_padded_estimates_are_flagged_both_ways(env):
+    bus, _, agent = env
+    user = agent("user")
+    coder = agent("coder", ["code.task"], owner="alice")
+    rev = agent("rev", ["code.review"], owner="bob")
+    tid = _auction_job(bus, user, coder, rev, eta_s=600, took_s=20)
+    assert "early: the ETA was 30x too long" in system_texts(user, tid, "estimate_check")[0]
+
+    slowpoke, hoarder = agent("slowpoke", ["code.task"]), agent("hoarder", ["code.task"])
+    _history(bus, slowpoke, 3, eta_s=600, took_s=30)                  # always "on time", by a mile
+    _history(bus, hoarder, 3, eta_s=100, took_s=90, tokens=(9000, 1000))  # tokens far over-estimated
+    assert bus.traits(slowpoke.me()["id"]) == ["#pads-estimates"]     # not "#on-time"
+    assert "#pads-estimates" in bus.traits(hoarder.me()["id"]) and "#on-time" not in bus.traits(hoarder.me()["id"])

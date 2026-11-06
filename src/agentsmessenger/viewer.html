@@ -173,11 +173,12 @@ async function renderThread(id) {
     el("label", { for: "say" }, t.state === "waiting_human" ? "Your answer" : "Message as human"), ta, el("div", { class: "row", style: "margin-top:6px" }, el("button", { class: "primary", type: "submit" }, "Send"))));
 }
 const KINDS = { code: "coding", summarize: "summarizing", payment: "payments" };
-const GOOD = ["#on-time", "#accurate-estimates", "#budget"], BAD = ["#late", "#token-heavy", "#over-budget"];
+const GOOD = ["#on-time", "#accurate-estimates", "#budget"], BAD = ["#late", "#token-heavy", "#over-budget", "#pads-estimates"];
 const HELP = { "#on-time": "finishes within its ETA", "#late": "often finishes after its ETA",
   "#accurate-estimates": "token use close to its estimates", "#token-heavy": "often uses more tokens than estimated",
   "#over-budget": "often costs more than its price", "#expensive": "priced well above others for this work",
-  "#budget": "priced well below others for this work" };
+  "#budget": "priced well below others for this work",
+  "#pads-estimates": "ETAs or token estimates are usually far too generous" };
 function badgeClass(b) { return b.startsWith("#1 ") ? "gold" : GOOD.includes(b) ? "good" : BAD.includes(b) ? "bad" : ""; }
 function badgeHelp(b) { return HELP[b] || "rank for this type of work"; }
 function dur(s) { s = Math.round(s); return s < 120 ? s + "s" : Math.floor(s / 60) + "m" + String(s % 60).padStart(2, "0") + "s"; }
@@ -237,7 +238,7 @@ function renderCoordination(t, id, box) {
       el("div", {}, el("span", { class: "tag" }, "#" + kindLabel(t.kind)), ` ${t.routing.strategy || "balanced"} · assigned to `, el("strong", {}, names[t.assigned_to || t.owner] || "—"),
         t.routing.price_usd != null ? ` at $${t.routing.price_usd.toFixed(3)}` : ""));
     const list = el("div", { class: "muted", style: "font-size:12px" });
-    for (const c of t.routing.candidates) list.append(el("div", {}, `${c.name}: ${c.price_usd != null ? "$" + c.price_usd.toFixed(3) : "price ?"} · ${c.rating}★ (${c.tasks} tasks) · value ${c.value_usd != null ? "$" + c.value_usd.toFixed(4) : "sealed"}${c.explored ? " · newcomer chance" : ""}`));
+    for (const c of t.routing.candidates) list.append(el("div", {}, `${c.name}: ${c.price_usd != null ? "$" + c.price_usd.toFixed(3) : "price ?"} · ${c.rating}★ (${c.tasks} tasks) · value ${c.value_usd != null ? "$" + c.value_usd.toFixed(4) : "sealed"}${c.eta_s ? " · ETA " + dur(c.eta_s) + (c.eta_slip && c.eta_slip !== 1 ? ` (usually ${c.eta_slip}×)` : "") : ""}${c.explored ? " · newcomer chance" : ""}`));
     r.append(list);
     if (!done && window._agents) {
       const sel = el("select", { "aria-label": "Reassign to" }, ...window._agents.map((a) => el("option", { value: a.name }, a.name)));

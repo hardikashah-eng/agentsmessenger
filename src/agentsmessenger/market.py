@@ -5,10 +5,13 @@ Who gets the work
     mode) or its rate card / cost hint (instant mode, the default). The
     winner has the lowest *value*:
 
-        value = price / P(pass review) ** k      (k: cheapest 0.5, balanced 1, quality 3)
+        value = price / P(pass review) ** k  x  (credible ETA / typical ETA) ** t
 
-    so a cheap agent whose work is often rejected doesn't win on price alone.
-    Load and being offline make an agent slightly less attractive.
+    (k, t: cheapest 0.5, 0.1; balanced 1, 0.3; quality 3, 0.2; fastest 1, 1), so
+    a cheap agent whose work is often rejected doesn't win on price alone, and a
+    faster one wins ties. The credible ETA is the promised ETA times how much the
+    agent usually overruns, so neither over-promising nor padding pays. Load and
+    being offline make an agent slightly less attractive.
 
 Reputation
     Each agent has a rating per type of work (code, writing, ...) and role
@@ -43,7 +46,9 @@ if TYPE_CHECKING:
 HUMAN = "human"
 KIND_LABELS = {"code": "coding", "writing": "writing", "research": "research", "summarize": "summarizing",
                "data": "data", "payment": "payments", "general": "general"}
-K = {"cheapest": 0.5, "balanced": 1.0, "quality": 3.0}
+K = {"cheapest": 0.5, "balanced": 1.0, "quality": 3.0, "fastest": 1.0}  # weight on P(pass)
+T = {"cheapest": 0.1, "balanced": 0.3, "quality": 0.2, "fastest": 1.0}  # weight on (credible) ETA
+PADDED = 1 / 3  # finishing in under a third of the ETA means the estimate was padded
 
 
 @dataclass
@@ -102,9 +107,13 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
                      budget: float | None = None, explore: bool = True) -> list[dict[str, Any]]:
         """offers: {"agent": AgentRecord, "capability", "price_usd", "eta_s"?}. Best (lowest value) first."""
         k = K.get(strategy or "balanced", 1.0)
+        t_w = T.get(strategy or "balanced", 0.3)
         now = utcnow()
         known = [o["price_usd"] for o in offers if o.get("price_usd") is not None]
         fallback = statistics.median(known) if known else 1.0
+        slips = {o["agent"].id: self.eta_slip(o["agent"].id) for o in offers}
+        credible = {o["agent"].id: o["eta_s"] * slips[o["agent"].id] for o in offers if o.get("eta_s")}
+        typical = statistics.median(credible.values()) if credible else None
         out = []
         for o in offers:
             a: AgentRecord = o["agent"]
@@ -117,8 +126,12 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
             online = self.is_online(a, now)
             value = (price if price is not None else fallback) / (p ** k)
             value *= (1 + 0.15 * load) * (1.0 if online else 1.25) * (0.95 if o.get("exact") else 1.0)
+            eta_c = credible.get(a.id)
+            if typical:  # no ETA while others give one counts as slower than typical
+                value *= ((eta_c if eta_c else 1.25 * typical) / typical) ** t_w
             out.append({"agent": a.id, "name": a.name, "vendor": a.vendor, "capability": o["capability"],
                         "price_usd": price, "eta_s": o.get("eta_s"), "tokens_est": o.get("tokens_est"),
+                        "eta_slip": round(slips[a.id], 2), "credible_eta_s": round(eta_c, 1) if eta_c else None,
                         "chance": round(p, 3), "rating": stars(p), "traits": self.traits(a.id),
                         "tasks": rep["tasks"], "new": rep["tasks"] < self.market.probation_tasks,
                         "value_usd": round(value, 6), "online": online, "load": load})
@@ -318,6 +331,15 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
         return {"assigned_at": now.isoformat(), "eta_s": eta, "tokens_est": offer.get("tokens_est"),
                 "due_at": (now + timedelta(seconds=eta)).isoformat() if eta else None}
 
+    def eta_slip(self, agent_id: str) -> float:
+        """How much the agent's jobs usually overrun their ETA (median actual / promised), from 3+ jobs.
+        1.0 means it keeps its word; 2.0 means it takes twice as long as it says."""
+        ratios = [d["took_s"] / d["eta_s"] for d in self.store.deliveries(agent_id, limit=20)
+                  if d["eta_s"] and d["took_s"] is not None]
+        if len(ratios) < 3:
+            return 1.0
+        return min(3.0, max(0.5, statistics.median(ratios)))
+
     def check_delivery(self, t: Thread, worker: str, kind: str) -> dict[str, Any]:
         """Compare the finished job with the estimate: wall-clock time, tokens and cost.
         Posts the comparison, keeps it as a delivery record, and counts misses against the worker."""
@@ -336,13 +358,21 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
         self.store.record_delivery(row)
         parts, misses = [], 0.0
         if eta:
-            parts.append(f"took {_dur(took)} vs ETA {_dur(eta)} ({'on time' if on_time else 'late'})")
             if not on_time:
+                verdict = "late"
                 misses += 0.5
+            elif took < PADDED * eta:
+                verdict = f"early: the ETA was {eta / max(took, 1):.0f}x too long"
+                misses += 0.1  # padded estimates make planning harder too
+            else:
+                verdict = "on time"
+            parts.append(f"took {_dur(took)} vs ETA {_dur(eta)} ({verdict})")
         if est and used is not None:
             parts.append(f"{used:,} tokens vs {est:,} estimated ({(used - est) / est:+.0%})")
             if used > 1.25 * est:
                 misses += 0.25
+            elif used < PADDED * est:
+                misses += 0.1
         elif est:
             parts.append(f"tokens not reported (estimated {est:,})")
         if price is not None:
@@ -361,11 +391,16 @@ class MarketMixin:  # pylint: disable=too-few-public-methods
         """Behaviour badges from the agent's recent deliveries (at least 3 of the relevant kind)."""
         recent = self.store.deliveries(agent_id, limit=20)
         out = []
-        timed = [d["on_time"] for d in recent if d["on_time"] is not None]
-        if len(timed) >= 3:
-            rate = sum(timed) / len(timed)
-            out += ["#on-time"] if rate >= 0.8 else ["#late"] if rate <= 0.66 else []
+        timed = [d for d in recent if d["on_time"] is not None and d["eta_s"]]
         tok = [d["tokens_used"] / d["tokens_est"] for d in recent if d["tokens_est"] and d["tokens_used"] is not None]
+        eta_ratios = [d["took_s"] / d["eta_s"] for d in timed]
+        padded = (len(eta_ratios) >= 3 and sum(r < PADDED for r in eta_ratios) / len(eta_ratios) >= 0.5) or \
+                 (len(tok) >= 3 and sum(x < PADDED for x in tok) / len(tok) >= 0.5)
+        if padded:
+            out.append("#pads-estimates")  # "on time" only because the estimates are far too generous
+        if len(timed) >= 3:
+            rate = sum(d["on_time"] for d in timed) / len(timed)
+            out += ["#late"] if rate <= 0.66 else ["#on-time"] if rate >= 0.8 and not padded else []
         if len(tok) >= 3:
             if sum(abs(x - 1) <= 0.25 for x in tok) / len(tok) >= 0.8:
                 out.append("#accurate-estimates")

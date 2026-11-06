@@ -23,7 +23,7 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--require-signatures", action="store_true", help="every agent must register a key and sign envelopes")
     s.add_argument("--no-routing", action="store_true", help="broadcast capability requests instead of assigning one agent")
     s.add_argument("--no-verification", action="store_true", help="don't have another agent check results (not recommended)")
-    s.add_argument("--strategy", choices=["balanced", "cheapest", "quality"], default="balanced", help="default routing preference")
+    s.add_argument("--strategy", choices=["balanced", "cheapest", "quality", "fastest"], default="balanced", help="default routing preference")
     s.add_argument("--claim-timeout", type=float, default=90, help="seconds before unclaimed work goes to the next agent")
     s.add_argument("--review-timeout", type=float, default=300, help="seconds before an unanswered review goes to another reviewer")
     s.add_argument("--bidding", choices=["instant", "auction"], default="instant",

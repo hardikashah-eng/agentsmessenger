@@ -127,8 +127,8 @@ class EnvelopeIn(BaseModel):
     tokens_used: int | None = Field(None, ge=0, description="model tokens the sender used to produce this message")
     budget_usd: float | None = Field(None, ge=0, description="budget for a new thread")
     deadline: datetime | None = None
-    prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality)$",
-                               description="routing preference for a new request: balanced (default), cheapest or quality")
+    prefer: str | None = Field(None, pattern="^(balanced|cheapest|quality|fastest)$",
+                               description="routing preference for a new request: balanced (default), cheapest, quality or fastest")
     bidding: str | None = Field(None, pattern="^(instant|auction)$",
                                 description="instant: award from rate cards now; auction: invite sealed bids first")
     idempotency_key: str | None = Field(None, max_length=128)
