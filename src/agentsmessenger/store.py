@@ -81,6 +81,33 @@ CREATE TABLE IF NOT EXISTS agent_stats (
 );
 """
 
+CREATE_MARKET = """
+CREATE TABLE IF NOT EXISTS reputation (
+  agent_id TEXT NOT NULL,
+  kind TEXT NOT NULL,           -- type of work: code, writing, ...
+  role TEXT NOT NULL,           -- worker | reviewer
+  alpha REAL NOT NULL DEFAULT 1,
+  beta REAL NOT NULL DEFAULT 1,
+  tasks INTEGER NOT NULL DEFAULT 0,
+  approved INTEGER NOT NULL DEFAULT 0,
+  rejected INTEGER NOT NULL DEFAULT 0,
+  failed INTEGER NOT NULL DEFAULT 0,
+  earned_usd REAL NOT NULL DEFAULT 0,
+  updated_at TEXT,
+  PRIMARY KEY (agent_id, kind, role)
+);
+CREATE TABLE IF NOT EXISTS ledger (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  thread_id TEXT,
+  account TEXT NOT NULL,
+  delta_usd REAL NOT NULL,
+  memo TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ledger_account ON ledger(account, id);
+"""
+REP_COUNTERS = ("tasks", "approved", "rejected", "failed", "earned_usd")
+
 STAT_FIELDS = ("assigned", "approved", "rejected", "failed", "timeouts", "reviews", "cost_usd")
 ACTIVE_STATES = ("claimed", "working", "verifying")
 
@@ -145,9 +172,13 @@ class _LockedConn:
 class Store:
     def __init__(self, path: str = ":memory:") -> None:
         self._lock = threading.RLock()
+        # Held by the bus for a whole state change, so readers never see one half-done
+        # (e.g. a routed message before its routing note).
+        self.lock = self._lock
         self._db = _LockedConn(path, self._lock)
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        self._db.executescript(CREATE_MARKET)
         self.last_seq = self.max_seq()  # lets streams skip queries when nothing is new
 
     # ------------------------------------------------------------- agents
@@ -445,3 +476,51 @@ class Store:
             f"SELECT data FROM threads WHERE json_extract(data, '$.state') IN ({','.join('?' * len(states))}) "
             "ORDER BY updated_at LIMIT ?", [*states, limit]).fetchall()
         return [Thread.model_validate_json(r[0]) for r in rows]
+
+    # --------------------------------------------------------- reputation
+    def reputation(self, agent_id: str, kind: str, role: str = "worker") -> dict[str, Any]:
+        r = self._db.execute("SELECT * FROM reputation WHERE agent_id=? AND kind=? AND role=?",
+                             (agent_id, kind, role)).fetchone()
+        if not r:
+            return {"agent_id": agent_id, "kind": kind, "role": role, "alpha": 1.0, "beta": 1.0,
+                    **{k: 0 for k in REP_COUNTERS}, "updated_at": None}
+        return dict(r)
+
+    def update_reputation(self, agent_id: str, kind: str, role: str, *, good: float = 0.0, bad: float = 0.0,
+                          decay: float = 1.0, **counters: float) -> dict[str, Any]:
+        """Decay the old evidence toward the neutral prior, then add the new evidence."""
+        with self._lock, self._db:
+            cur = self.reputation(agent_id, kind, role)
+            alpha = 1 + (cur["alpha"] - 1) * decay + good
+            beta = 1 + (cur["beta"] - 1) * decay + bad
+            vals = {k: cur[k] + counters.get(k, 0) for k in REP_COUNTERS}
+            self._db.execute(
+                "INSERT INTO reputation(agent_id, kind, role, alpha, beta, tasks, approved, rejected, failed, earned_usd,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_id, kind, role) DO UPDATE SET "
+                "alpha=excluded.alpha, beta=excluded.beta, tasks=excluded.tasks, approved=excluded.approved, "
+                "rejected=excluded.rejected, failed=excluded.failed, earned_usd=excluded.earned_usd, "
+                "updated_at=excluded.updated_at",
+                (agent_id, kind, role, alpha, beta, *vals.values(), utcnow().isoformat()))
+        return self.reputation(agent_id, kind, role)
+
+    def all_reputation(self) -> list[dict[str, Any]]:
+        return [dict(r) for r in self._db.execute("SELECT * FROM reputation ORDER BY kind, role").fetchall()]
+
+    # ------------------------------------------------------------- ledger
+    def post_ledger(self, entries: list[tuple[str, float, str]], thread_id: str | None) -> None:
+        """Entries are (account, delta_usd, memo); written together."""
+        now = utcnow().isoformat()
+        with self._lock, self._db:
+            self._db.executemany("INSERT INTO ledger(at, thread_id, account, delta_usd, memo) VALUES (?,?,?,?,?)",
+                                 [(now, thread_id, a, d, m) for a, d, m in entries])
+
+    def ledger(self, account: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+        if account:
+            rows = self._db.execute("SELECT * FROM ledger WHERE account=? ORDER BY id DESC LIMIT ?", (account, limit))
+        else:
+            rows = self._db.execute("SELECT * FROM ledger ORDER BY id DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows.fetchall()]
+
+    def balance(self, account: str) -> float:
+        r = self._db.execute("SELECT COALESCE(SUM(delta_usd), 0) FROM ledger WHERE account=?", (account,)).fetchone()
+        return round(float(r[0]), 6)

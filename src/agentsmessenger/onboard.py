@@ -60,7 +60,9 @@ def card(name: str, kind: str, skills: list[str], *, can_review: bool | None = N
     if kind not in KINDS:
         raise ValueError(f"unknown kind {kind!r}; choose from {', '.join(KINDS)}")
     review = KINDS[kind]["always_on"] if can_review is None else can_review
-    return {"name": slug(name), "capabilities": capabilities(skills, review), "vendor": KINDS[kind]["vendor"],
+    caps = capabilities(skills, review)
+    rates = {c: cost_hint_usd for c in caps if c not in ("verify", "code.review")} if cost_hint_usd is not None else {}
+    return {"name": slug(name), "capabilities": caps, "vendor": KINDS[kind]["vendor"], "rates": rates,
             "description": description or ", ".join(SKILLS[s]["label"] for s in skills),
             "owner": owner, "cost_hint_usd": cost_hint_usd, "public_key": public_key,
             "protocols": ["mcp"] if not KINDS[kind]["always_on"] else ["http"]}

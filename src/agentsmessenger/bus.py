@@ -5,9 +5,12 @@ Transport-agnostic: the HTTP server, the MCP adapter and tests all call this.
 
 from __future__ import annotations
 
-from typing import Any
+import functools
+import random
+from typing import Any, Callable, TypeVar
 
 from .guards import GuardConfig, GuardError, Guards, Forbidden, NotFound, UNTRUSTED_NOTICE, injection_flags
+from .market import MarketConfig, MarketMixin, label
 from .memory import MemoryMixin
 from .models import (
     Address, AgentCard, AgentRecord, ContextPack, Delivery, Envelope, EnvelopeIn, Intent,
@@ -17,15 +20,33 @@ from .router import HUMAN, SYSTEM, RouterConfig, RouterMixin
 from .signing import ServerSigner, valid_public_key, verify
 from .store import Store
 
-__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM", "RouterConfig"]
+__all__ = ["Bus", "Forbidden", "NotFound", "HUMAN", "SYSTEM", "RouterConfig", "MarketConfig"]
 
 
-class Bus(MemoryMixin, RouterMixin):
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def _serialized(fn: F) -> F:
+    """State changes read a thread, modify it and save it, often over several writes. Run them
+    one at a time, holding the store's lock throughout, so concurrent requests (two bids, two
+    claims) can't overwrite each other and readers never see a change half-applied."""
+    @functools.wraps(fn)
+    def wrapper(self: "Bus", *a: Any, **kw: Any) -> Any:
+        with self.state_lock:
+            return fn(self, *a, **kw)
+    return wrapper  # type: ignore[return-value]
+
+
+class Bus(MemoryMixin, RouterMixin, MarketMixin):
     def __init__(self, store: Store | None = None, guard_config: GuardConfig | None = None,
                  signer: ServerSigner | None = None, require_signatures: bool = False,
-                 router: RouterConfig | None = None) -> None:
+                 router: RouterConfig | None = None, market: MarketConfig | None = None,
+                 seed: int | None = None) -> None:
         self.store = store or Store()
         self.router = router or RouterConfig()
+        self.market = market or MarketConfig()
+        self._rng = random.Random(seed)
+        self.state_lock = self.store.lock
         self.guards = Guards(guard_config)
         self.signer = signer or ServerSigner()
         self.require_signatures = require_signatures
@@ -69,6 +90,7 @@ class Bus(MemoryMixin, RouterMixin):
         return a
 
     # ------------------------------------------------------------- sending
+    @_serialized
     def send(self, sender: AgentRecord | None, env: EnvelopeIn, transport: str = "native") -> Envelope:
         """Send an envelope. sender=None means the human observer."""
         sender_id = sender.id if sender else HUMAN
@@ -127,7 +149,8 @@ class Bus(MemoryMixin, RouterMixin):
 
         stored = self.store.append(env, thread_id=thread.id, sender=sender_id, sender_kind=kind,
                                    verified=verified, signer=self.signer,
-                                   to_agent_id=to_agent.id if to_agent else plan["candidates"][0]["agent"] if plan else None)
+                                   to_agent_id=to_agent.id if to_agent else
+                                   plan["candidates"][0]["agent"] if plan and plan["mode"] == "instant" else None)
 
         thread = self._thread(thread.id)
         thread.message_count += 1
@@ -139,7 +162,9 @@ class Bus(MemoryMixin, RouterMixin):
             self.store.add_participant(thread, to_agent.id)
         if stored.memory_refs:
             self.grant_refs_to_thread(sender.id if sender else None, stored)
-        if plan:
+        if plan and plan["mode"] == "auction":
+            self.open_auction(self._thread(thread.id), stored, plan)
+        elif plan:
             self.apply_route(self._thread(thread.id), stored, plan)
         if sender and env.cost_usd:
             self.store.bump_stats(sender.id, cost_usd=env.cost_usd)
@@ -188,6 +213,7 @@ class Bus(MemoryMixin, RouterMixin):
     def get_thread(self, thread_id: str) -> Thread:
         return self._thread(thread_id)
 
+    @_serialized
     def claim(self, agent: AgentRecord, thread_id: str) -> Thread:
         t = self._thread(thread_id)
         if agent.paused:
@@ -196,6 +222,8 @@ class Bus(MemoryMixin, RouterMixin):
             return t
         if t.state != ThreadState.open or t.owner:
             raise GuardError("already_claimed", f"thread is {t.state.value}" + (f", owned by {t.owner}" if t.owner else ""))
+        if t.market.get("status") == "open":
+            raise GuardError("bidding_open", "this request is open for bids; bid instead of claiming", 409)
         if t.assigned_to and t.assigned_to != agent.id:
             owner = self.store.get_agent(t.assigned_to)
             raise Forbidden(f"the router assigned this thread to {owner.name if owner else t.assigned_to}")
@@ -208,6 +236,7 @@ class Bus(MemoryMixin, RouterMixin):
         self._system(t.id, {"event": "claimed", "owner": agent.id}, f"{agent.name} claimed this thread")
         return self._thread(t.id)
 
+    @_serialized
     def set_state(self, agent: AgentRecord | None, thread_id: str, state: ThreadState, reason: str | None = None) -> Thread:
         t = self._thread(thread_id)
         if agent is not None and agent.id not in (t.owner, t.creator):
@@ -226,8 +255,12 @@ class Bus(MemoryMixin, RouterMixin):
                 t.verification["status"] = "overridden"
             if agent is not None and agent.id == t.owner and not self.router.verify:
                 self.store.bump_stats(agent.id, approved=1)
+                self.store.update_reputation(agent.id, t.kind or "general", "worker", tasks=1)
+                self.settle(t, agent.id)
+                t = self._thread(thread_id)
         if state == ThreadState.failed and agent is not None and agent.id == t.owner and t.routing.get("request_seq"):
             self.store.bump_stats(agent.id, failed=1)
+            self.record_failure(t, agent.id)
             if self.router.enabled and t.state not in TERMINAL:
                 # Next capable agent; with none left the thread fails as usual.
                 moved = self.reroute(t, f"{agent.name} failed" + (f": {reason}" if reason else ""), on_failure=True)
@@ -256,6 +289,7 @@ class Bus(MemoryMixin, RouterMixin):
         self.maybe_verify(agent, t, mine[-1])
         return self._thread(t.id)
 
+    @_serialized
     def update_blackboard(self, agent: AgentRecord, thread_id: str, patch: dict[str, Any]) -> Thread:
         t = self._thread(thread_id)
         if agent.id not in t.participants:
@@ -313,7 +347,11 @@ class Bus(MemoryMixin, RouterMixin):
             raise Forbidden("not a participant of this thread")
         msgs = self.store.thread_messages(thread_id, 0, 10_000)
         answered = {m.in_reply_to for m in msgs if m.intent in (Intent.result, Intent.reject, Intent.error) and m.in_reply_to}
-        open_requests = [m for m in msgs if m.intent == Intent.request and m.seq not in answered]
+        # A reply to the router's copy of a request answers the original too.
+        copies = {int(k): v.get("original") for k, v in (t.routing.get("messages") or {}).items() if v.get("original")}
+        answered |= {copies[s] for s in list(answered) if s in copies}
+        # The router's own requests (calls for bids, work copies, review requests) aren't open work.
+        open_requests = [m for m in msgs if m.intent == Intent.request and m.sender != SYSTEM and m.seq not in answered]
         # Reviewers' verdicts live in t.verification; results here are the work itself.
         review_reqs = {int(k) for k, m in (t.routing.get("messages") or {}).items() if m.get("kind") == "verification"}
         work = [m for m in msgs if m.intent == Intent.result and m.in_reply_to not in review_reqs]
@@ -330,8 +368,17 @@ class Bus(MemoryMixin, RouterMixin):
         ]
         if t.pause_reason:
             lines.append(f"Paused because: {t.pause_reason}.")
+        m = t.market
+        if m.get("status") == "open":
+            lines.append(f"Bidding open until {m['closes_at']} ({len(m.get('bids', {}))} of {len(m['invited'])} bids in).")
+        elif m.get("award"):
+            price = m["award"].get("price_usd")
+            lines.append(f"Awarded to {names.get(m['award']['agent'], m['award']['agent'])}"
+                         + (f" at ${price:.3f}" if price is not None else "") + ".")
         if t.assigned_to and not t.owner:
-            lines.append(f"Router assigned it to {names.get(t.assigned_to, t.assigned_to)} ({t.kind or 'request'}).")
+            lines.append(f"Router assigned it to {names.get(t.assigned_to, t.assigned_to)} (#{label(t.kind)}).")
+        if t.routing.get("paid"):
+            lines.append(f"Paid ${t.routing['paid']:.3f} on approval.")
         v = t.verification
         if v.get("status") == "pending":
             lines.append(f"Waiting for verification by {names.get(v.get('verifier'), v.get('verifier'))}.")
@@ -354,14 +401,26 @@ class Bus(MemoryMixin, RouterMixin):
             recent=[self.deliver(rid, m) for m in msgs[-recent:]] if recent > 0 else [],
             memory=memory, notice=UNTRUSTED_NOTICE, max_tokens=max_tokens,
         )
+        pack.thread = self.redact(t, reader.id if reader else None)
         return fit_to_budget(pack, max_tokens) if max_tokens else _measured(pack)
 
+    # Mixin operations that change state, serialized the same way.
+    submit_bid = _serialized(MarketMixin.submit_bid)
+    tick = _serialized(RouterMixin.tick)
+    assign = _serialized(RouterMixin.assign)
+    human_verdict = _serialized(RouterMixin.human_verdict)
+    remember = _serialized(MemoryMixin.remember)
+    share_memory = _serialized(MemoryMixin.share_memory)
+    forget = _serialized(MemoryMixin.forget)
+
     # --------------------------------------------------------------- human
+    @_serialized
     def human_pause_agent(self, agent_ref: str, paused: bool) -> AgentRecord:
         a = self.resolve_agent(agent_ref)
         self.store.set_agent_paused(a.id, paused)
         return self.resolve_agent(a.id)
 
+    @_serialized
     def human_pause_thread(self, thread_id: str, paused: bool, reason: str | None = None) -> Thread:
         t = self._thread(thread_id)
         if paused:

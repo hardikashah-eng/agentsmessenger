@@ -64,13 +64,13 @@ class Client:
              subject: str | None = None, in_reply_to: int | None = None, cost_usd: float = 0.0,
              budget_usd: float | None = None, idempotency_key: str | None = None,
              artifacts: list[str] | None = None, memory_refs: list[str] | None = None,
-             prefer: str | None = None) -> dict[str, Any]:
+             prefer: str | None = None, bidding: str | None = None) -> dict[str, Any]:
         body: dict[str, Any] = {
             "intent": intent, "to": {"agent": to_agent, "capability": to_capability},
             "thread_id": thread_id, "payload": payload or {}, "text": text, "subject": subject,
             "in_reply_to": in_reply_to, "cost_usd": cost_usd, "budget_usd": budget_usd,
             "idempotency_key": idempotency_key, "artifacts": artifacts or [], "memory_refs": memory_refs or None,
-            "prefer": prefer,
+            "prefer": prefer, "bidding": bidding,
         }
         body = {k: v for k, v in body.items() if v is not None}
         if self.signing_key:
@@ -82,10 +82,24 @@ class Client:
         router works out what kind of request it is and picks the best agent."""
         return self.send("request", to_capability=capability, payload=payload, **kw)
 
-    def ask(self, text: str, payload: dict[str, Any] | None = None, prefer: str | None = None, **kw: Any) -> dict[str, Any]:
-        """Plain-language request; the router picks who does it (prefer: balanced | cheapest | quality)."""
+    def ask(self, text: str, payload: dict[str, Any] | None = None, prefer: str | None = None,
+            bidding: str | None = None, **kw: Any) -> dict[str, Any]:
+        """Plain-language request; the router picks who does it (prefer: balanced | cheapest | quality).
+        bidding="auction" invites sealed bids first; "instant" awards from rate cards right away."""
         return self.send("request", payload=payload or {}, text=text, subject=kw.pop("subject", text[:120]),
-                         prefer=prefer, **kw)
+                         prefer=prefer, bidding=bidding, **kw)
+
+    def bid(self, thread_id: str, price_usd: float, eta_s: float | None = None, plan: str = "",
+            confidence: float | None = None) -> dict[str, Any]:
+        """Sealed bid on a request you were invited to (a delivery with route.kind == 'bid_call')."""
+        return self._req("POST", f"/v1/threads/{thread_id}/bids",
+                         json={"price_usd": price_usd, "eta_s": eta_s, "plan": plan, "confidence": confidence})
+
+    def leaderboard(self, role: str = "worker") -> dict[str, Any]:
+        return self._req("GET", "/v1/leaderboard", params={"role": role})
+
+    def ledger(self) -> dict[str, Any]:
+        return self._req("GET", "/v1/ledger")
 
     def route_preview(self, text: str | None = None, capability: str | None = None, payload: dict[str, Any] | None = None,
                       prefer: str | None = None) -> dict[str, Any]:

@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from agentsmessenger import Bus, Client, MessengerError, Store
 from agentsmessenger.agent import Agent, Result, Verdict
 from agentsmessenger.models import utcnow
+from agentsmessenger.market import MarketConfig
 from agentsmessenger.router import RouterConfig, classify
 from agentsmessenger.server import create_app
 
@@ -20,7 +21,7 @@ OBS = "obs_test"
 @pytest.fixture
 def env():
     def make(**router):
-        bus = Bus(Store(), router=RouterConfig(**router))
+        bus = Bus(Store(), router=RouterConfig(**router), market=MarketConfig(explore_rate=0))
         http = TestClient(create_app(bus, observer_token=OBS, tick_seconds=0))
 
         def agent(name, caps=(), vendor="test", cost=None):
@@ -52,6 +53,7 @@ def test_classify():
     assert classify(None, {}, "Fix the bug in parse_date() and add unit tests", None) == "code"
     assert classify(None, {}, "Summarize this report", None) == "summarize"
     assert classify("code.task", {}, None, None) == "code"
+    assert classify(None, {}, "Production is_leap(year) with tests", None) == "code"  # snake_case call
     assert classify(None, {"question": "what is the capital of peru"}, None, None) == "general"
 
 
@@ -76,11 +78,11 @@ def test_cost_and_track_record_drive_the_choice(env):
     assert bus.get_thread(user.request("code.task", {"x": 1})["thread_id"]).assigned_to == cheap.me()["id"]
 
     # A strong track record wins when the requester prefers quality.
-    bus.store.bump_stats(pricey.me()["id"], approved=20)
-    bus.store.bump_stats(cheap.me()["id"], approved=2, rejected=8)
+    bus.store.update_reputation(pricey.me()["id"], "code", "worker", good=20, tasks=20, approved=20)
+    bus.store.update_reputation(cheap.me()["id"], "code", "worker", good=2, bad=8, tasks=10, approved=2, rejected=8)
     t = bus.get_thread(user.request("code.task", {"x": 2}, prefer="quality")["thread_id"])
     assert t.assigned_to == pricey.me()["id"]
-    assert t.routing["candidates"][0]["track_record"].startswith("20 approved")
+    assert t.routing["candidates"][0]["tasks"] == 20 and t.routing["price_usd"] == 0.50
     # A budget too small for an agent rules it out.
     t2 = bus.get_thread(user.request("code.task", {"x": 3}, prefer="quality", budget_usd=0.05)["thread_id"])
     assert t2.assigned_to == cheap.me()["id"]

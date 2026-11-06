@@ -52,6 +52,15 @@ class Result:
 
 
 @dataclass
+class Bid:
+    """What a bidder returns: its price and how long it will take."""
+    price_usd: float
+    eta_s: float | None = None
+    plan: str = ""
+    confidence: float | None = None
+
+
+@dataclass
 class Verdict:
     """What a reviewer returns: approve or reject, with notes for the worker."""
     approve: bool
@@ -135,6 +144,8 @@ class Agent:
         self.client = client
         self.handlers: dict[str, Handler] = {}
         self.default: Handler | None = None
+        self.bidder: Handler | None = None
+        self.default_eta_s: float = 120.0
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
         self._me: dict[str, Any] | None = None
         self._stop = threading.Event()
@@ -167,6 +178,14 @@ class Agent:
         return cls(c)
 
     # ----------------------------------------------------------- handlers
+    def bids(self) -> Callable[[Handler], Handler]:
+        """Custom bidding: the handler gets the call for bids and returns a Bid, or None to pass.
+        Without one, the agent bids its rate card (or cost hint) for capabilities it handles."""
+        def deco(fn: Handler) -> Handler:
+            self.bidder = fn
+            return fn
+        return deco
+
     def reviews(self, *capabilities: str) -> Callable[[Handler], Handler]:
         """Register a reviewer. Default capability `verify`; add `code.review` to check code.
         The handler gets {"task": ..., "result": ..., "category": ...} and returns a Verdict."""
@@ -200,6 +219,9 @@ class Agent:
             return
         route = delivery.get("route")
         memory = delivery.get("memory") or []
+        if route and route.get("kind") == "bid_call":
+            self._pool.submit(self._bid, e, route)
+            return
         if route:  # the router sent this to us specifically
             fn = self.handlers.get(route.get("capability") or "")
             if route.get("kind") == "verification":
@@ -220,6 +242,27 @@ class Agent:
         if fn is None:
             return
         self._pool.submit(self._run, fn, e, memory)
+
+    def _bid(self, e: dict[str, Any], route: dict[str, Any]) -> None:
+        cap = route.get("capability") or ""
+        if cap not in self.handlers and self.default is None:
+            return
+        try:
+            if self.bidder is not None:
+                out: Any = self.bidder(e.get("payload") or {}, Task(self, e, None, route))
+                if out is None:
+                    return
+                b = out if isinstance(out, Bid) else Bid(float(out))
+            else:
+                me = self.client.me()
+                kind = (e.get("payload") or {}).get("type") or ""
+                price = next((me["rates"][k] for k in (cap, kind) if k in (me.get("rates") or {})), me.get("cost_hint_usd"))
+                if price is None:
+                    return  # no rate card: let others bid
+                b = Bid(price, self.default_eta_s, f"{me['name']} will handle this with {cap}")
+            self.client.bid(e["thread_id"], b.price_usd, b.eta_s, b.plan, b.confidence)
+        except MessengerError:
+            pass  # bidding closed or not allowed; nothing to do
 
     def _review(self, fn: Handler, e: dict[str, Any], memory: list[dict[str, Any]], route: dict[str, Any]) -> None:
         task = Task(self, e, memory, route)
@@ -275,7 +318,8 @@ class Agent:
         me = self.client.me()
         caps = sorted(set(me["capabilities"]) | set(self.handlers))
         if caps != me["capabilities"]:
-            card = {k: me[k] for k in ("description", "protocols", "vendor", "owner", "cost_hint_usd", "public_key", "a2a_url")}
+            card = {k: me[k] for k in ("description", "protocols", "vendor", "owner", "cost_hint_usd", "public_key", "a2a_url",
+                                       "rates")}
             self._me = self.client.update_card(me["name"], caps, **card)
 
     def run(self, mode: str = "sse") -> None:

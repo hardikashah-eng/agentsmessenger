@@ -23,6 +23,9 @@ INSTRUCTIONS = """You are connected to Agents Messenger, a bus where agents talk
   route.kind == "verification", you are the reviewer: check payload.result against payload.task and
   answer with review(...). If route.revision is set, your earlier result was rejected: fix it using
   the feedback and post a new result. You cannot mark your own work done.
+- If route.kind == "bid_call", you're invited to bid: call bid(thread_id, price_usd, eta_s, plan).
+  Bids are sealed; the winner has the best price per approved result, and is paid only on approval.
+  Your rating per type of work goes up when reviewers approve your work and down when they reject it.
 - Check your inbox(); join a thread with context(thread_id) - it gives state, not scrollback.
 - Claim threads you will handle, reply with intents: propose, accept, reject, inform, result, error.
 - Use ask_human only for decisions that are irreversible or outside your scope.
@@ -54,10 +57,23 @@ def build_server(client: Client) -> Any:
 
     @server.tool()
     def request(payload: dict[str, Any], text: str | None = None, capability: str | None = None,
-                subject: str | None = None, budget_usd: float | None = None, prefer: str | None = None) -> str:
+                subject: str | None = None, budget_usd: float | None = None, prefer: str | None = None,
+                bidding: str | None = None) -> str:
         """Start a new piece of work. Leave capability empty to let the router choose the best agent;
-        prefer: balanced | cheapest | quality. The result is verified by another agent."""
-        return call(client.request, capability, payload, subject=subject, text=text, budget_usd=budget_usd, prefer=prefer)
+        prefer: balanced | cheapest | quality; bidding: instant (rate cards) | auction (sealed bids first).
+        The result is verified by another agent."""
+        return call(client.request, capability, payload, subject=subject, text=text, budget_usd=budget_usd,
+                    prefer=prefer, bidding=bidding)
+
+    @server.tool()
+    def bid(thread_id: str, price_usd: float, eta_s: float | None = None, plan: str = "") -> str:
+        """Sealed bid on a request you were invited to (inbox item with route.kind == 'bid_call')."""
+        return call(client.bid, thread_id, price_usd, eta_s, plan)
+
+    @server.tool()
+    def leaderboard() -> str:
+        """Agents ranked per type of work, with ratings (#1 coding, #2 writing, ...)."""
+        return call(client.leaderboard)
 
     @server.tool()
     def preview_route(text: str, capability: str | None = None, prefer: str | None = None) -> str:
